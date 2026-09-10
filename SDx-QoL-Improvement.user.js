@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.1
+// @version      1.2
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control, To Do List row highlighting, and optional auto-close of the To Do List step-details panel.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
@@ -14,7 +14,7 @@
     'use strict';
     if (window.__sdxQoLImprovementV10Loaded) return;
     window.__sdxQoLImprovementV10Loaded = true;
-    const SCRIPT_NAME = 'SDx QoL Improvement v1.1';
+    const SCRIPT_NAME = 'SDx QoL Improvement v1.2';
     const STORAGE_PREFIX = 'sdxQoLSettingsV10';
     const CHECKBOX_SELECTOR = 'input[type="checkbox"].mdc-checkbox__native-control';
     let lastCheckbox = null;
