@@ -1,13 +1,14 @@
 // ==UserScript==
-// @name         SDx QoL Improvement v1.1.0
+// @name         SDx QoL Improvement v1.1
 // @namespace    https://burnsmcd.com
-// @version      1.1.0
+// @version      1.1
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control, To Do List row highlighting, and optional auto-close of the To Do List step-details panel.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
 // @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvements.user.js
 // @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvements.user.js
 // @run-at       document-start
+// @author        Josue Gutierrez
 // ==/UserScript==
 (function () {
     'use strict';
