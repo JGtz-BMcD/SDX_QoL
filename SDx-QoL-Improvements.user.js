@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         SDx QoL Improvement v1.1
+// @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
 // @version      1.1
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control, To Do List row highlighting, and optional auto-close of the To Do List step-details panel.
