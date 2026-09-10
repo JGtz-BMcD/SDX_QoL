@@ -5,8 +5,8 @@
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, column manager, and SDx Kendo page-size control.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
-// @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-QoL-Improvements/main/SDx-QoL-Improvement.user.js
-// @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDx-QoL-Improvements/main/SDx-QoL-Improvement.user.js
+// @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvements.user.js
+// @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvements.user.js
 // ==/UserScript==
 
 (function () {
