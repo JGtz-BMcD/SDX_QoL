@@ -14,7 +14,7 @@
     'use strict';
     if (window.__sdxQoLImprovementV10Loaded) return;
     window.__sdxQoLImprovementV10Loaded = true;
-    const SCRIPT_NAME = 'SDx QoL Improvement v1.1.0';
+    const SCRIPT_NAME = 'SDx QoL Improvement v1.1';
     const STORAGE_PREFIX = 'sdxQoLSettingsV10';
     const CHECKBOX_SELECTOR = 'input[type="checkbox"].mdc-checkbox__native-control';
     let lastCheckbox = null;
