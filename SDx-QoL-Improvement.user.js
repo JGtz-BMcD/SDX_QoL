@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.3
-// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control, To Do List row highlighting, and optional auto-close of the To Do List step-details panel.
+// @version      1.4
+// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control (now remembered per list), To Do List row highlighting, optional auto-close of the To Do List step-details panel, and bulk file download (bypasses SDx's 100-file dialog limit).
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
 // @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvement.user.js
@@ -14,20 +14,25 @@
     'use strict';
     if (window.__sdxQoLImprovementV10Loaded) return;
     window.__sdxQoLImprovementV10Loaded = true;
-    const SCRIPT_NAME = 'SDx QoL Improvement v1.2';
+    const SCRIPT_NAME = 'SDx QoL Improvement';
     const STORAGE_PREFIX = 'sdxQoLSettingsV10';
     const CHECKBOX_SELECTOR = 'input[type="checkbox"].mdc-checkbox__native-control';
     let lastCheckbox = null;
     let lastUrl = location.href;
     let activeTab = 'columns';
-    // Row/page-size control is click-only.
-    // It does not hide rows and does not run automatically on page load.
+    // Row/page-size: the user sets it via Apply (or a preset) in the Rows
+    // tab, it's saved per-list, and maybeAutoApplyPageSize() restores it
+    // automatically the next time that same list loads. It does not hide
+    // rendered rows - it only asks the Kendo grid/pager for a different page
+    // size.
     let lastAppliedPageSize = null;
     const MANAGER = {
         buttonId: 'sdx-qol-manager-button',
         menuId: 'sdx-qol-manager-menu',
         styleId: 'sdx-qol-manager-style'
     };
+    const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
+    const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
     console.log(`${SCRIPT_NAME} loaded`);
     //////////////////////////////////////////////////////////////////////
     // SHARED HELPERS
@@ -1085,6 +1090,90 @@
                 background: #d13438 !important;
                 box-shadow: 0 0 0 2px #ffffff !important;
             }
+            #${DL_BUTTON_ID} {
+                margin-left: 8px !important;
+                padding: 5px 12px !important;
+                border: 1px solid #0e6b0e !important;
+                border-radius: 4px !important;
+                background: #107c10 !important;
+                color: #ffffff !important;
+                font: 13px Arial, sans-serif !important;
+                font-weight: 600 !important;
+                cursor: pointer !important;
+                height: 30px !important;
+                line-height: 18px !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                gap: 5px !important;
+                vertical-align: middle !important;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.25) !important;
+            }
+            #${DL_BUTTON_ID}:hover {
+                background: #0b5e0b !important;
+                border-color: #094d09 !important;
+            }
+            .sdx-qol-dl-backdrop {
+                position: fixed !important;
+                inset: 0 !important;
+                background: rgba(0,0,0,0.35) !important;
+                z-index: 999996 !important;
+            }
+            .sdx-qol-dl-panel {
+                position: fixed !important;
+                top: 50% !important;
+                left: 50% !important;
+                transform: translate(-50%, -50%) !important;
+                z-index: 999997 !important;
+                width: 480px !important;
+                max-width: 90vw !important;
+                max-height: 80vh !important;
+                display: flex !important;
+                flex-direction: column !important;
+                background: #ffffff !important;
+                color: #222222 !important;
+                border-radius: 6px !important;
+                box-shadow: 0 6px 24px rgba(0,0,0,0.35) !important;
+                padding: 14px !important;
+                font: 13px Arial, sans-serif !important;
+            }
+            .sdx-qol-dl-list {
+                overflow: auto !important;
+                border: 1px solid #dddddd !important;
+                border-radius: 4px !important;
+                padding: 6px 8px !important;
+                margin-bottom: 10px !important;
+                max-height: 240px !important;
+            }
+            .sdx-qol-dl-list-item {
+                padding: 2px 0 !important;
+                border-bottom: 1px solid #f0f0f0 !important;
+            }
+            .sdx-qol-dl-list-item:last-child {
+                border-bottom: none !important;
+            }
+            .sdx-qol-dl-options {
+                display: flex !important;
+                flex-direction: column !important;
+                gap: 6px !important;
+                margin-bottom: 6px !important;
+            }
+            .sdx-qol-dl-panel .sdx-actions {
+                display: flex !important;
+                flex-direction: row !important;
+                gap: 8px !important;
+            }
+            .sdx-qol-dl-panel .sdx-actions button {
+                flex: 0 0 auto !important;
+            }
+            .sdx-qol-dl-name-input {
+                width: 100% !important;
+                margin-top: 4px !important;
+                padding: 5px !important;
+                border: 1px solid #aaaaaa !important;
+                border-radius: 4px !important;
+                font: 13px Arial, sans-serif !important;
+                box-sizing: border-box !important;
+            }
         `;
         document.head.appendChild(style);
     }
@@ -1650,9 +1739,607 @@
     }
     installSessionWatcher();
     //////////////////////////////////////////////////////////////////////
+    // MODULE 3H
+    // BULK FILE DOWNLOAD ("DL Files")
+    //////////////////////////////////////////////////////////////////////
+    // SDx's own download flow (checkbox-select rows -> Actions > Files >
+    // Save PDF/CAD/Excel Files... / Save Target As...) opens a "Select files
+    // to download" dialog that is silently capped at 100 files: confirmed via
+    // live network capture that this is a fixed page size baked into the
+    // listing call that populates that dialog ($top=100, always, regardless
+    // of how many rows were actually selected) - not a backend limit. Nothing
+    // downstream of that dialog has any such cap: RetrieveFileUris resolves
+    // one selected row's own OBID directly to its actual attached file
+    // (confirmed working identically for a PDF, an .nwd, and a .stp file with
+    // no type-specific handling needed), and DownloadFile just zips whatever
+    // file list it's handed. So rather than fighting SDx's own menu/dialog,
+    // this adds a separate "DL Files" button next to Columns/Rows that talks
+    // to those same two endpoints directly - no cap, no dependency on SDx's
+    // own dialog ever opening.
+    //
+    // NEW - added but not yet confirmed working live. Test with a small
+    // selection (2-3 files) first and check the console for warnings before
+    // trusting it on a large batch.
+    function stripBearerPrefix(token) {
+        return String(token || '').replace(/^Bearer\s+/i, '').trim();
+    }
+    function looksLikeJwt(value) {
+        return typeof value === 'string' && value.split('.').length === 3;
+    }
+    // Scans broadly (any sessionStorage key with "auth" in its name) rather
+    // than a single hardcoded key, since this script is used by multiple
+    // people and should not assume one exact key name from one browser/Okta
+    // config. This is SDx's own frontend session token - no dependency on any
+    // other userscript being installed.
+    function getTokenFromNativeSessionStorage() {
+        try {
+            for (let i = 0; i < sessionStorage.length; i++) {
+                const key = sessionStorage.key(i);
+                if (!key || !/auth/i.test(key)) continue;
+                const raw = sessionStorage.getItem(key);
+                if (!raw) continue;
+                try {
+                    const parsed = JSON.parse(raw);
+                    const candidate = parsed && (parsed.authorization || parsed.Authorization || parsed.accessToken || parsed.access_token || parsed.token);
+                    if (typeof candidate === 'string') {
+                        const stripped = stripBearerPrefix(candidate);
+                        if (looksLikeJwt(stripped)) return stripped;
+                    }
+                } catch (innerErr) {
+                    const stripped = stripBearerPrefix(raw);
+                    if (looksLikeJwt(stripped)) return stripped;
+                }
+            }
+        } catch (err) {
+            console.warn('SDx QoL: getTokenFromNativeSessionStorage failed', err);
+        }
+        return null;
+    }
+    // Defensive fallback only - some users also run a separate "SDx Add
+    // Reviewer" userscript that caches its own auth headers here.
+    function getTokenFromReviewerWizard() {
+        try {
+            const raw = localStorage.getItem('sdxbr_auth_headers_v07');
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            const candidate = parsed && (parsed.authorization || parsed.Authorization);
+            if (typeof candidate === 'string') {
+                const stripped = stripBearerPrefix(candidate);
+                if (looksLikeJwt(stripped)) return stripped;
+            }
+        } catch (err) {
+            console.warn('SDx QoL: getTokenFromReviewerWizard failed', err);
+        }
+        return null;
+    }
+    function getSdxAuthToken() {
+        return getTokenFromNativeSessionStorage() || getTokenFromReviewerWizard() || null;
+    }
+    function getSdaApiBase() {
+        return `${location.origin}/ENR01Server/api/v2/SDA`;
+    }
+    async function mapWithConcurrency(items, limit, fn) {
+        const results = new Array(items.length);
+        let nextIndex = 0;
+        async function worker() {
+            while (nextIndex < items.length) {
+                const current = nextIndex++;
+                try {
+                    results[current] = { ok: true, value: await fn(items[current], current) };
+                } catch (err) {
+                    results[current] = { ok: false, error: err };
+                }
+            }
+        }
+        const workerCount = Math.max(1, Math.min(limit, items.length));
+        await Promise.all(Array.from({ length: workerCount }, worker));
+        return results;
+    }
+    // Resolves the Kendo grid widget from THIS checkbox's own closest .k-grid
+    // ancestor, rather than grabbing whichever .k-grid happens to be first on
+    // the page - a page can have more than one Kendo grid (filter panels,
+    // sidebars, etc.), and calling dataItem() against the wrong widget
+    // silently returns nothing.
+    function getKendoGridWidgetForElement(el) {
+        const gridEl = el && el.closest ? el.closest('.k-grid') : null;
+        if (!gridEl) return null;
+        return getKendoWidgetFromElement(gridEl, ['kendoGrid']);
+    }
+    // Resolves each checked checkbox back to its row's own data item so we can
+    // read the row's OBID/Name - keyed by data-uid rather than DOM position,
+    // and falls back to searching for a twin row sharing the same data-uid in
+    // case this grid also splits locked/scroll columns into separate <tr>s
+    // (confirmed to happen on at least one other SDx grid in this script).
+    function getSelectedFileRowsForDownload() {
+        const results = [];
+        const seenUids = new Set();
+        getVisibleCheckboxes().forEach(cb => {
+            if (!cb.checked) return;
+            const widget = getKendoGridWidgetForElement(cb);
+            if (!widget || typeof widget.dataItem !== 'function') {
+                console.warn('SDx QoL: DL Files - checked checkbox is not inside a recognizable Kendo grid', cb);
+                return;
+            }
+            const row = cb.closest('tr, [role="row"], [role="none"]');
+            if (!row) {
+                console.warn('SDx QoL: DL Files - could not find a row element for a checked checkbox', cb);
+                return;
+            }
+            const uid = row.getAttribute('data-uid');
+            if (uid && seenUids.has(uid)) return;
+            let item = null;
+            try {
+                item = widget.dataItem(row);
+            } catch (err) {
+                item = null;
+            }
+            if (!item && uid) {
+                const gridEl = cb.closest('.k-grid');
+                const twin = gridEl ? gridEl.querySelector(`[data-uid="${uid}"][role="row"]`) : null;
+                if (twin) {
+                    try {
+                        item = widget.dataItem(twin);
+                    } catch (err) {
+                        item = null;
+                    }
+                }
+            }
+            if (!item) {
+                console.warn('SDx QoL: DL Files - widget.dataItem() returned nothing for a checked row', row, 'data-uid:', uid);
+                return;
+            }
+            // Different SDx grids expose the row's own short identifier under
+            // different field names - the To Do List grid uses OBID, this
+            // Results grid uses Id (confirmed live: both hold the same short
+            // alphanumeric code format, e.g. "P8HV03YA").
+            const obid = item.OBID || item.Id;
+            if (!obid) {
+                console.warn('SDx QoL: DL Files - resolved data item has no OBID/Id field', item);
+                return;
+            }
+            if (uid) seenUids.add(uid);
+            results.push({
+                obid,
+                name: normalizeText(item.Name || item.CI_Name || obid),
+                config: item.Config || item.SPFConfigUID || null
+            });
+        });
+        return results;
+    }
+    // Confirmed required via live network capture: a grid row's own OBID/Id
+    // is a DOCUMENT-level identifier, not the file key RetrieveFileUris
+    // expects - calling RetrieveFileUris directly with it 404s. SDx's own
+    // native flow resolves each document to its actual attached file first,
+    // via this exact query shape: Objects filtered by the document OBIDs,
+    // $expand=SPFFileComposition_21(...) (the same "viewable or editable
+    // business file" filter SDx's own JS uses), which returns each document
+    // alongside a nested SPFDesignFile object - THAT object's own OBID is
+    // the real file key. This same resolve query has its own hardcoded
+    // $top=100, so it's sub-batched internally in groups of 100 regardless
+    // of the caller's own chunk/zip size.
+    async function resolveFileObidsForDocuments(rows, token) {
+        const map = new Map();
+        const groups = new Map();
+        rows.forEach(row => {
+            const key = row.config || '';
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(row);
+        });
+        const expandFilter = "Interfaces eq 'ISPFBusinessFile' and SPFViewInd eq 'true' or SPFEditInd eq 'true'";
+        for (const [config, groupRows] of groups) {
+            for (let i = 0; i < groupRows.length; i += 100) {
+                const subBatch = groupRows.slice(i, i + 100);
+                const filter = `(${subBatch.map(r => `OBID eq '${String(r.obid).replace(/'/g, "''")}'`).join(' or ')})`;
+                const expand = `SPFFileComposition_21($filter=${expandFilter};$skip=0;$top=1;$count=true)`;
+                const params = new URLSearchParams();
+                params.set('$filter', filter);
+                params.set('$select', 'Name,OBID');
+                params.set('$expand', expand);
+                params.set('$skip', '0');
+                params.set('$top', '100');
+                params.set('$count', 'true');
+                const url = `${getSdaApiBase()}/Objects?${params.toString()}`;
+                const headers = {
+                    Accept: 'application/json, text/plain, */*',
+                    Authorization: `Bearer ${token}`
+                };
+                if (config) headers.SPFConfigUID = config;
+                const resp = await fetch(url, { method: 'GET', headers });
+                if (!resp.ok) {
+                    throw new Error(`Resolve step failed (HTTP ${resp.status}) for config ${config || '(none)'}`);
+                }
+                const data = await resp.json();
+                (data.value || []).forEach(item => {
+                    const comp = Array.isArray(item.SPFFileComposition_21) ? item.SPFFileComposition_21[0] : null;
+                    if (item.OBID && comp && comp.OBID) {
+                        map.set(item.OBID, comp.OBID);
+                    }
+                });
+            }
+        }
+        return map;
+    }
+    async function retrieveFileUriForObid(obid, token) {
+        const url = `${getSdaApiBase()}/Files('${encodeURIComponent(obid)}')/Intergraph.SPF.Server.API.Model.RetrieveFileUris`;
+        const resp = await fetch(url, {
+            method: 'POST',
+            headers: {
+                Accept: 'application/json, text/plain, */*',
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`
+            },
+            body: JSON.stringify({ purposes: ['Primary'], downloadFile: true })
+        });
+        if (!resp.ok) {
+            throw new Error(`RetrieveFileUris failed (HTTP ${resp.status})`);
+        }
+        const data = await resp.json();
+        const info = data && Array.isArray(data.value) ? data.value[0] : null;
+        if (!info || !info.Uri) {
+            throw new Error('No file URI returned for this item');
+        }
+        return {
+            FileOBID: info.FileId || obid,
+            ParentFileOBID: info.ParentFileOBID || null,
+            URL: info.Uri,
+            ContentLength: Number(info.ContentLength) || 0
+        };
+    }
+    // Uses XHR instead of fetch so we can report real bytes-received progress
+    // via onprogress while the browser downloads the finished zip - the
+    // server-side zip assembly itself (which is the slow part for large
+    // batches) happens before any bytes are sent, so this only lights up
+    // once the transfer actually starts, but it's real signal when it does.
+    function downloadFileChunkWithProgress(urlListEntries, token, onProgress) {
+        return new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', `${getSdaApiBase()}/DownloadFile`);
+            xhr.responseType = 'blob';
+            xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
+            xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+            xhr.onprogress = function (event) {
+                if (onProgress) onProgress(event.loaded, event.lengthComputable ? event.total : 0);
+            };
+            xhr.onload = function () {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(xhr.response);
+                } else {
+                    reject(new Error(`DownloadFile failed (HTTP ${xhr.status})`));
+                }
+            };
+            xhr.onerror = function () {
+                reject(new Error('DownloadFile failed (network error)'));
+            };
+            xhr.send(JSON.stringify({ URLList: urlListEntries }));
+        });
+    }
+    function formatBytes(bytes) {
+        if (!Number.isFinite(bytes) || bytes < 0) return 'unknown size';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        let value = bytes;
+        let unitIndex = 0;
+        while (value >= 1024 && unitIndex < units.length - 1) {
+            value /= 1024;
+            unitIndex++;
+        }
+        return `${value.toFixed(unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+    }
+    function formatElapsed(ms) {
+        const totalSeconds = Math.floor(ms / 1000);
+        const m = Math.floor(totalSeconds / 60);
+        const s = totalSeconds % 60;
+        return m > 0 ? `${m}m ${s}s` : `${s}s`;
+    }
+    function getAutoZipBaseName() {
+        const d = new Date();
+        const pad = n => String(n).padStart(2, '0');
+        return `SDx-Download_${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    }
+    function sanitizeZipBaseName(name) {
+        const cleaned = normalizeText(name).replace(/[\\/:*?"<>|]/g, '_');
+        return cleaned || getAutoZipBaseName();
+    }
+    function triggerBlobDownload(blob, filename) {
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
+    }
+    // Phase 1: resolve every selected row to its actual file (document->file
+    // OBID mapping, then RetrieveFileUris for the URL + size) up front, once,
+    // regardless of how the user later chooses to chunk the ZIPs. This gives
+    // a real file count/size estimate before any zipping starts, and a real
+    // X-of-Y progress readout since the total is known in advance.
+    async function resolveAllRowsForModal(rows, statusEl, sizeEl, startButton) {
+        startButton.disabled = true;
+        const token = getSdxAuthToken();
+        if (!token) {
+            statusEl.textContent = 'Could not find an SDx auth token in this browser session. Make sure you are logged in to SDx in this tab and try again.';
+            return null;
+        }
+        statusEl.textContent = `Resolving files: 0 of ${rows.length}...`;
+        let fileObidMap;
+        try {
+            fileObidMap = await resolveFileObidsForDocuments(rows, token);
+        } catch (err) {
+            statusEl.textContent = `Could not resolve selected files: ${err.message}`;
+            return null;
+        }
+        let done = 0;
+        const results = await mapWithConcurrency(rows, 6, async row => {
+            const fileObid = fileObidMap.get(row.obid);
+            if (!fileObid) {
+                throw new Error('No matching design file found for this document');
+            }
+            const entry = await retrieveFileUriForObid(fileObid, token);
+            done++;
+            statusEl.textContent = `Resolving files: ${done} of ${rows.length}...`;
+            return { row, entry };
+        });
+        const resolvedEntries = [];
+        const failedNames = [];
+        let totalBytes = 0;
+        results.forEach((r, idx) => {
+            if (r.ok) {
+                resolvedEntries.push(r.value);
+                totalBytes += r.value.entry.ContentLength || 0;
+            } else {
+                console.warn('SDx QoL: DL Files - failed to resolve', rows[idx], r.error);
+                failedNames.push(rows[idx].name);
+            }
+        });
+        if (failedNames.length) {
+            sizeEl.textContent = `${resolvedEntries.length} of ${rows.length} file(s) ready (~${formatBytes(totalBytes)}). ${failedNames.length} could not be resolved: ${failedNames.slice(0, 5).join(', ')}${failedNames.length > 5 ? '...' : ''}`;
+        } else {
+            sizeEl.textContent = `${resolvedEntries.length} file(s) ready - estimated total size ~${formatBytes(totalBytes)}.`;
+        }
+        statusEl.textContent = resolvedEntries.length ? 'Ready to download.' : 'Nothing could be resolved for download.';
+        startButton.disabled = resolvedEntries.length === 0;
+        return { resolvedEntries, totalBytes, token };
+    }
+    // Phase 2: chunk the already-resolved entries into ZIPs and download each
+    // in turn. Shows an elapsed-time ticker while the server assembles each
+    // ZIP (that's the slow part for large batches, with no progress signal
+    // available), then switches to real bytes-received progress once the
+    // browser starts actually receiving the finished ZIP.
+    async function startBulkZipDownload(resolvedEntries, chunkSize, token, baseName, statusEl) {
+        const safeChunkSize = Math.max(1, chunkSize || resolvedEntries.length);
+        const chunks = [];
+        for (let i = 0; i < resolvedEntries.length; i += safeChunkSize) {
+            chunks.push(resolvedEntries.slice(i, i + safeChunkSize));
+        }
+        const failedOverall = [];
+        for (let c = 0; c < chunks.length; c++) {
+            const chunkItems = chunks[c];
+            const urlListEntries = chunkItems.map((item, idx) => ({
+                FileOBID: item.entry.FileOBID,
+                ParentFileOBID: item.entry.ParentFileOBID,
+                URL: item.entry.URL,
+                Name: `File ${idx}`
+            }));
+            const chunkBytes = chunkItems.reduce((sum, item) => sum + (item.entry.ContentLength || 0), 0);
+            const startTime = Date.now();
+            const elapsedTimer = setInterval(function () {
+                statusEl.textContent = `Zipping batch ${c + 1} of ${chunks.length} (${chunkItems.length} files, ~${formatBytes(chunkBytes)})... elapsed ${formatElapsed(Date.now() - startTime)}`;
+            }, 1000);
+            statusEl.textContent = `Zipping batch ${c + 1} of ${chunks.length} (${chunkItems.length} files, ~${formatBytes(chunkBytes)})...`;
+            try {
+                const blob = await downloadFileChunkWithProgress(urlListEntries, token, function (loaded, total) {
+                    if (total) {
+                        statusEl.textContent = `Downloading batch ${c + 1} of ${chunks.length}: ${formatBytes(loaded)} of ${formatBytes(total)}...`;
+                    }
+                });
+                clearInterval(elapsedTimer);
+                const filename = chunks.length > 1 ? `${baseName}_${c + 1}of${chunks.length}.zip` : `${baseName}.zip`;
+                triggerBlobDownload(blob, filename);
+            } catch (err) {
+                clearInterval(elapsedTimer);
+                console.warn('SDx QoL: DL Files - batch download failed', err);
+                statusEl.textContent = `Batch ${c + 1} of ${chunks.length} failed: ${err.message}`;
+                failedOverall.push(...chunkItems.map(item => item.row.name));
+            }
+        }
+        if (failedOverall.length) {
+            statusEl.textContent = `Done. ${failedOverall.length} file(s) could not be downloaded and were skipped: ${failedOverall.slice(0, 10).join(', ')}${failedOverall.length > 10 ? '...' : ''}`;
+        } else {
+            statusEl.textContent = 'Done - all files downloaded.';
+        }
+    }
+    function closeDlFilesModal() {
+        const modal = document.getElementById(DL_MODAL_ID);
+        if (modal) modal.remove();
+    }
+    function renderDlFilesModal(modal, rows) {
+        modal.innerHTML = '';
+        const backdrop = document.createElement('div');
+        backdrop.className = 'sdx-qol-dl-backdrop';
+        backdrop.addEventListener('click', closeDlFilesModal);
+        const panel = document.createElement('div');
+        panel.className = 'sdx-qol-dl-panel';
+        panel.addEventListener('click', e => e.stopPropagation());
+        const title = document.createElement('div');
+        title.className = 'sdx-title';
+        title.textContent = `⬇ Download ${rows.length} Selected File${rows.length === 1 ? '' : 's'}`;
+        const list = document.createElement('div');
+        list.className = 'sdx-qol-dl-list';
+        rows.forEach(r => {
+            const line = document.createElement('div');
+            line.className = 'sdx-qol-dl-list-item';
+            line.textContent = r.name;
+            list.appendChild(line);
+        });
+        const sizeEl = document.createElement('div');
+        sizeEl.className = 'sdx-note';
+        sizeEl.style.margin = '6px 0';
+        sizeEl.textContent = 'Estimating total size...';
+        const optionsRow = document.createElement('div');
+        optionsRow.className = 'sdx-qol-dl-options';
+        const singleLabel = document.createElement('label');
+        singleLabel.className = 'sdx-item';
+        const singleRadio = document.createElement('input');
+        singleRadio.type = 'radio';
+        singleRadio.name = 'sdx-qol-dl-mode';
+        singleRadio.checked = rows.length <= 100;
+        const singleSpan = document.createElement('span');
+        singleSpan.textContent = 'Single ZIP (all files in one download)';
+        singleLabel.appendChild(singleRadio);
+        singleLabel.appendChild(singleSpan);
+        const splitLabel = document.createElement('label');
+        splitLabel.className = 'sdx-item';
+        const splitRadio = document.createElement('input');
+        splitRadio.type = 'radio';
+        splitRadio.name = 'sdx-qol-dl-mode';
+        splitRadio.checked = rows.length > 100;
+        const splitSpan = document.createElement('span');
+        splitSpan.textContent = 'Split into ZIPs of';
+        const batchSizeInput = document.createElement('input');
+        batchSizeInput.type = 'number';
+        batchSizeInput.min = '1';
+        batchSizeInput.value = '100';
+        batchSizeInput.style.width = '55px';
+        batchSizeInput.style.margin = '0 4px';
+        const filesSpan = document.createElement('span');
+        filesSpan.textContent = 'files each';
+        splitLabel.appendChild(splitRadio);
+        splitLabel.appendChild(splitSpan);
+        splitLabel.appendChild(batchSizeInput);
+        splitLabel.appendChild(filesSpan);
+        optionsRow.appendChild(singleLabel);
+        optionsRow.appendChild(splitLabel);
+        const nameRow = document.createElement('div');
+        nameRow.className = 'sdx-qol-dl-options';
+        const autoLabel = document.createElement('label');
+        autoLabel.className = 'sdx-item';
+        const autoCheckbox = document.createElement('input');
+        autoCheckbox.type = 'checkbox';
+        autoCheckbox.checked = true;
+        const autoSpan = document.createElement('span');
+        autoSpan.textContent = 'Auto-name';
+        autoLabel.appendChild(autoCheckbox);
+        autoLabel.appendChild(autoSpan);
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.placeholder = 'ZIP file name (without .zip)';
+        nameInput.value = getAutoZipBaseName();
+        nameInput.disabled = true;
+        nameInput.className = 'sdx-qol-dl-name-input';
+        autoCheckbox.addEventListener('change', function () {
+            nameInput.disabled = autoCheckbox.checked;
+            if (autoCheckbox.checked) nameInput.value = getAutoZipBaseName();
+        });
+        nameRow.appendChild(autoLabel);
+        nameRow.appendChild(nameInput);
+        const statusEl = document.createElement('div');
+        statusEl.className = 'sdx-note';
+        statusEl.style.margin = '8px 0';
+        statusEl.textContent = 'Resolving files...';
+        const actions = document.createElement('div');
+        actions.className = 'sdx-actions';
+        const startButton = document.createElement('button');
+        startButton.type = 'button';
+        startButton.className = 'sdx-apply';
+        startButton.textContent = 'Start Download';
+        startButton.disabled = true;
+        const closeButton = document.createElement('button');
+        closeButton.type = 'button';
+        closeButton.textContent = 'Close';
+        closeButton.addEventListener('click', closeDlFilesModal);
+        actions.appendChild(startButton);
+        actions.appendChild(closeButton);
+        panel.appendChild(title);
+        panel.appendChild(list);
+        panel.appendChild(sizeEl);
+        panel.appendChild(optionsRow);
+        panel.appendChild(nameRow);
+        panel.appendChild(statusEl);
+        panel.appendChild(actions);
+        modal.appendChild(backdrop);
+        modal.appendChild(panel);
+        resolveAllRowsForModal(rows, statusEl, sizeEl, startButton).then(function (resolution) {
+            if (!resolution) return;
+            startButton.addEventListener('click', function () {
+                startButton.disabled = true;
+                const chunkSize = singleRadio.checked ? resolution.resolvedEntries.length : Math.max(1, Number(batchSizeInput.value) || 100);
+                const baseName = sanitizeZipBaseName(autoCheckbox.checked ? getAutoZipBaseName() : nameInput.value);
+                startBulkZipDownload(resolution.resolvedEntries, chunkSize, resolution.token, baseName, statusEl).finally(function () {
+                    startButton.disabled = false;
+                });
+            });
+        });
+    }
+    function openDlFilesModal() {
+        closeDlFilesModal();
+        const rows = getSelectedFileRowsForDownload();
+        if (rows.length === 0) {
+            alert('SDx QoL: could not read any selected rows for download. Check the console for details, or try re-selecting the checkboxes.');
+            return;
+        }
+        const modal = document.createElement('div');
+        modal.id = DL_MODAL_ID;
+        renderDlFilesModal(modal, rows);
+        document.body.appendChild(modal);
+    }
+    function countCheckedCheckboxes() {
+        return getVisibleCheckboxes().filter(cb => cb.checked).length;
+    }
+    function injectDlFilesButton() {
+        if (!isTopFrame()) return;
+        const columnsButton = document.getElementById(MANAGER.buttonId);
+        if (!columnsButton || !columnsButton.parentElement) return;
+        let button = document.getElementById(DL_BUTTON_ID);
+        const checkedCount = countCheckedCheckboxes();
+        if (checkedCount < 2) {
+            if (button) button.remove();
+            return;
+        }
+        if (!button) {
+            button = document.createElement('button');
+            button.id = DL_BUTTON_ID;
+            button.type = 'button';
+            button.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                openDlFilesModal();
+            }, true);
+            columnsButton.insertAdjacentElement('afterend', button);
+        }
+        button.textContent = `⬇ DL Files (${checkedCount})`;
+        button.title = "Download all selected files as one or more ZIPs - bypasses SDx's own 100-file dialog limit";
+    }
+    document.addEventListener('change', function (e) {
+        const checkbox = e.target.closest ? e.target.closest(CHECKBOX_SELECTOR) : null;
+        if (!checkbox) return;
+        injectDlFilesButton();
+    }, true);
+    document.addEventListener('click', function (e) {
+        const checkbox = e.target.closest ? e.target.closest(CHECKBOX_SELECTOR) : null;
+        if (!checkbox) return;
+        setTimeout(injectDlFilesButton, 0);
+    }, true);
+    //////////////////////////////////////////////////////////////////////
     // MODULE 4
     // PAGE REFRESH HANDLER
     //////////////////////////////////////////////////////////////////////
+    // Restores this list's last-saved rows-per-page setting automatically.
+    // Guarded by lastAppliedPageSize so it only ever runs once per navigation
+    // (applySdxPageSize itself sets that on success) - if the grid/pager
+    // isn't rendered yet, this simply no-ops and retries on the next refresh
+    // cycle rather than erroring.
+    function maybeAutoApplyPageSize() {
+        if (lastAppliedPageSize !== null) return;
+        const settings = loadSettings();
+        const desired = Math.max(1, Number(settings.pageSize) || 100);
+        if (desired === 100) return; // matches SDx's own default - nothing to restore
+        const pagerEl = getLikelyMainPager();
+        if (!pagerEl) return;
+        const throwawayStatus = document.createElement('div');
+        applySdxPageSize(desired, throwawayStatus);
+    }
     function applyGridCustomizations() {
         // Column hiding is allowed to auto-apply.
         applyHiddenColumns();
@@ -1660,6 +2347,8 @@
         // No-ops on any page other than the To Do List.
         applyRowHighlighting();
         maybeSuppressStepDetailsPanel();
+        injectDlFilesButton();
+        maybeAutoApplyPageSize();
     }
     function refreshQoL() {
         injectStyles();
@@ -1669,8 +2358,8 @@
         if (location.href !== lastUrl) {
             lastUrl = location.href;
             closeManagerMenu();
-            // Do not auto-apply page size on navigation.
-            // User applies row/page-size manually from the Rows tab.
+            // Reset so maybeAutoApplyPageSize() restores this new list's own
+            // saved page size (if any) once its grid/pager has rendered.
             lastAppliedPageSize = null;
             setTimeout(function () {
                 injectManagerButton();
