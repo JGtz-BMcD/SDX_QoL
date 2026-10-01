@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.4
-// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager (kept out of embedded frames), SDx Kendo page-size control (now remembered per list), To Do List row highlighting, optional auto-close of the To Do List step-details panel, and bulk file download (bypasses SDx's 100-file dialog limit).
+// @version      1.5
+// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), and in-page PDF preview with next/previous, search, zoom, fit, print and download.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
+// @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
 // @downloadURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvement.user.js
 // @updateURL https://raw.githubusercontent.com/JGtz-BMcD/SDX_QoL/main/SDx-QoL-Improvement.user.js
 // @run-at       document-start
@@ -34,6 +35,123 @@
     const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
     const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
     console.log(`${SCRIPT_NAME} loaded`);
+    //////////////////////////////////////////////////////////////////////
+    // MODULE 0
+    // EARLY KENDO DATASOURCE HOOK (page size)
+    //////////////////////////////////////////////////////////////////////
+    // Confirmed via live capture: SDx's list grid has serverPaging on, its
+    // dataSource is built separately from the grid (grid.options.dataSource
+    // is null) and defaults to pageSize 100, so its very first request is
+    // .../AllDocuments_<id>?$top=100. Restoring the saved size AFTER that
+    // load forces a second full re-render. Instead, patch Kendo's DataSource
+    // constructor as soon as Kendo exists, so a list whose saved size isn't
+    // 100 is created with that size and loads once.
+    // Entirely best-effort: if the hook never finds Kendo, or the saved size
+    // can't be determined yet, nothing changes and maybeAutoApplyPageSize()
+    // (Module 4) restores it afterwards exactly as before.
+    const SDX_DEFAULT_PAGE_SIZE = 100;
+    function patchKendoDataSource(DataSourceClass) {
+        const proto = DataSourceClass && (DataSourceClass.fn || DataSourceClass.prototype);
+        if (!proto || typeof proto.init !== 'function') return false;
+        if (proto.__sdxQoLPageSizePatched) return true;
+        const originalInit = proto.init;
+        proto.init = function (options) {
+            try {
+                if (
+                    isTopFrame() &&
+                    options && typeof options === 'object' && !Array.isArray(options) &&
+                    options.serverPaging &&
+                    Number(options.pageSize) === SDX_DEFAULT_PAGE_SIZE
+                ) {
+                    const desired = Math.max(1, Number(loadSettings().pageSize) || SDX_DEFAULT_PAGE_SIZE);
+                    if (desired !== SDX_DEFAULT_PAGE_SIZE) {
+                        options.pageSize = desired;
+                        console.log(`${SCRIPT_NAME}: page-size hook - created list data source at saved size ${desired} (skipping the 100-row first load)`);
+                    }
+                }
+            } catch (err) {
+                console.warn('SDx QoL: page-size hook failed (falling back to post-load restore)', err);
+            }
+            return originalInit.apply(this, arguments);
+        };
+        proto.__sdxQoLPageSizePatched = true;
+        return true;
+    }
+    (function installKendoDataSourceHook() {
+        if (!isTopFrame()) return;
+        const startedAt = Date.now();
+        const timer = setInterval(function () {
+            let patched = false;
+            try {
+                const k = window.kendo;
+                if (k && k.data && k.data.DataSource) {
+                    patched = patchKendoDataSource(k.data.DataSource);
+                    if (patched) console.log(`${SCRIPT_NAME}: page-size hook installed`);
+                }
+            } catch (err) {
+                console.warn('SDx QoL: could not install page-size hook', err);
+                patched = true; // don't retry a throwing install forever
+            }
+            if (patched || Date.now() - startedAt > 60000) clearInterval(timer);
+        }, 5);
+    })();
+    //////////////////////////////////////////////////////////////////////
+    // MODULE 0B
+    // PASSIVE AUTH-TOKEN WATCHER
+    //////////////////////////////////////////////////////////////////////
+    // SDx renews its session token while you work, and the renewed token is
+    // not always written to sessionStorage. To always use a current one, this
+    // only LOOKS at the Authorization header SDx's own page already attaches
+    // to its own requests (it changes nothing about those requests) and
+    // remembers the one that expires latest. Used by getSdxAuthToken().
+    let capturedAuthToken = null;
+    function rememberAuthToken(raw) {
+        const token = stripBearerPrefix(raw);
+        if (!looksLikeJwt(token)) return;
+        if (!capturedAuthToken || jwtExpiryMs(token) >= jwtExpiryMs(capturedAuthToken)) {
+            capturedAuthToken = token;
+        }
+    }
+    function readHeaderCaseInsensitive(headers, name) {
+        if (!headers) return null;
+        try {
+            if (typeof Headers !== 'undefined' && headers instanceof Headers) return headers.get(name);
+            if (Array.isArray(headers)) {
+                const pair = headers.find(p => String(p[0]).toLowerCase() === name);
+                return pair ? pair[1] : null;
+            }
+            for (const key of Object.keys(headers)) {
+                if (key.toLowerCase() === name) return headers[key];
+            }
+        } catch (err) { /* ignore */ }
+        return null;
+    }
+    (function installAuthTokenWatcher() {
+        if (!isTopFrame()) return;
+        try {
+            const originalFetch = window.fetch;
+            if (typeof originalFetch === 'function') {
+                window.fetch = function (input, init) {
+                    try {
+                        const value =
+                            readHeaderCaseInsensitive(init && init.headers, 'authorization') ||
+                            (input && typeof input === 'object' ? readHeaderCaseInsensitive(input.headers, 'authorization') : null);
+                        if (value) rememberAuthToken(value);
+                    } catch (err) { /* never break the page's own request */ }
+                    return originalFetch.apply(this, arguments);
+                };
+            }
+            const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+            XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+                try {
+                    if (String(name).toLowerCase() === 'authorization') rememberAuthToken(value);
+                } catch (err) { /* never break the page's own request */ }
+                return originalSetRequestHeader.apply(this, arguments);
+            };
+        } catch (err) {
+            console.warn('SDx QoL: could not install auth token watcher', err);
+        }
+    })();
     //////////////////////////////////////////////////////////////////////
     // SHARED HELPERS
     //////////////////////////////////////////////////////////////////////
@@ -239,6 +357,14 @@
             fireInputEvents(cb);
         }
     }
+    // Large shift+click ranges (a few hundred rows) were locking up the tab
+    // long enough to trigger the browser's own "page unresponsive" warning,
+    // since each cb.click() synchronously runs Angular/Kendo's own change
+    // detection - and if a user closes/reloads the tab during that freeze
+    // instead of waiting it out, the selection is left silently incomplete.
+    // Processing the same range in small chunks spread across animation
+    // frames keeps the browser responsive regardless of range size, with no
+    // change to which boxes end up checked or their order.
     function selectCheckboxRange(startCb, endCb, desiredState) {
         const boxes = getVisibleCheckboxes();
         const startIndex = boxes.indexOf(startCb);
@@ -246,9 +372,19 @@
         if (startIndex < 0 || endIndex < 0) return;
         const minIndex = Math.min(startIndex, endIndex);
         const maxIndex = Math.max(startIndex, endIndex);
-        for (let i = minIndex; i <= maxIndex; i++) {
-            setCheckboxState(boxes[i], desiredState);
+        const range = boxes.slice(minIndex, maxIndex + 1);
+        const CHUNK_SIZE = 40;
+        let index = 0;
+        function processChunk() {
+            const end = Math.min(index + CHUNK_SIZE, range.length);
+            for (; index < end; index++) {
+                setCheckboxState(range[index], desiredState);
+            }
+            if (index < range.length) {
+                requestAnimationFrame(processChunk);
+            }
         }
+        processChunk();
     }
     document.addEventListener('click', function (e) {
         const checkbox = e.target.closest ? e.target.closest(CHECKBOX_SELECTOR) : null;
@@ -452,6 +588,26 @@
                 return cells.length > 0 && text.length > 0;
             });
     }
+    // Given a header cell, returns the data <table> that sits under the SAME
+    // header table (header tables and content tables appear in matching DOM
+    // order inside a .k-grid: [locked header, main header] / [locked body,
+    // main body]). Returns null when the structure isn't a recognizable
+    // Kendo grid, in which case callers keep their old, unscoped behavior.
+    function getPairedContentTable(headerCellEl) {
+        try {
+            const headerTable = headerCellEl && headerCellEl.closest ? headerCellEl.closest('table') : null;
+            const grid = headerTable ? headerTable.closest('.k-grid') : null;
+            if (!headerTable || !grid) return null;
+            const tables = [...grid.querySelectorAll('table')];
+            const headerTables = tables.filter(t => t.querySelector('thead th, thead td'));
+            const contentTables = tables.filter(t => !t.querySelector('thead') && t.querySelector('tbody tr'));
+            if (headerTables.length === 0 || headerTables.length !== contentTables.length) return null;
+            const idx = headerTables.indexOf(headerTable);
+            return idx >= 0 ? contentTables[idx] : null;
+        } catch (err) {
+            return null;
+        }
+    }
     function clearHiddenColumns() {
         document
             .querySelectorAll('.sdx-qol-hidden-column, .sdx-qol-hidden-orphan-cell')
@@ -461,10 +617,14 @@
             });
     }
     function applyHiddenColumns() {
-        clearHiddenColumns();
         const settings = loadSettings();
         const hiddenColumns = settings.hiddenColumns || [];
         const hideOrphanCells = Boolean(settings.hideOrphanCells);
+        // Nothing configured: just make sure no stale classes linger.
+        if (hiddenColumns.length === 0 && !hideOrphanCells) {
+            clearHiddenColumns();
+            return;
+        }
         const headers = getHeaderCells();
         if (headers.length === 0) return;
         const indexesToHide = new Set();
@@ -473,22 +633,43 @@
             const name = normalizeText(header.name);
             if (hiddenColumns.includes(name)) {
                 indexesToHide.add(header.index);
-                header.el.classList.add('sdx-qol-hidden-column');
             }
         });
         const headerCount = headers.length;
+        // Diff-based: only touch classes that actually need to change, instead
+        // of clearing everything and re-adding (which caused needless style
+        // recalculation and visible flicker on large grids).
+        const setClass = (el, cls, on) => {
+            if (el.classList.contains(cls) !== on) el.classList.toggle(cls, on);
+        };
+        headers.forEach(header => {
+            setClass(header.el, 'sdx-qol-hidden-column', indexesToHide.has(header.index));
+        });
+        // Kendo grids with locked (frozen) columns - like SDx's lists, where
+        // Name/checkbox/actions are frozen - are really TWO separate tables
+        // side by side. Header indexes come from just ONE of them (the
+        // scrolling side), so applying them to rows of the other (locked)
+        // table hid the wrong cells (e.g. the checkbox/actions/name cells
+        // when "Alt Doc Name" or "Title" was hidden). Only touch rows that
+        // belong to the same table pair as the header row we measured.
+        const scopeTable = getPairedContentTable(headers[0].el);
         getGridRows().forEach(row => {
             if (isHeaderRow(row)) return;
+            if (scopeTable && row.closest('table') !== scopeTable) return;
             const cells = getDirectCellsForRow(row);
+            // Fallback when the table pairing couldn't be determined: a row
+            // with fewer cells than the header row can't be the same table
+            // (e.g. the narrower locked side), so don't index into it.
+            if (!scopeTable && cells.length > 0 && cells.length < headerCount) return;
             cells.forEach((cell, index) => {
                 const header = headers[index];
-                if (header && header.isProtected) return;
-                if (indexesToHide.has(index)) {
-                    cell.classList.add('sdx-qol-hidden-column');
+                if (header && header.isProtected) {
+                    setClass(cell, 'sdx-qol-hidden-column', false);
+                    setClass(cell, 'sdx-qol-hidden-orphan-cell', false);
+                    return;
                 }
-                if (hideOrphanCells && index >= headerCount) {
-                    cell.classList.add('sdx-qol-hidden-orphan-cell');
-                }
+                setClass(cell, 'sdx-qol-hidden-column', indexesToHide.has(index));
+                setClass(cell, 'sdx-qol-hidden-orphan-cell', hideOrphanCells && index >= headerCount);
             });
         });
     }
@@ -715,9 +896,11 @@
                 if (typeof gridWidget.dataSource.page === 'function') {
                     gridWidget.dataSource.page(1);
                 }
-                if (typeof gridWidget.refresh === 'function') {
-                    gridWidget.refresh();
-                }
+                // No manual gridWidget.refresh() here: changing the data
+                // source's page size already triggers a read and the grid
+                // refreshes itself when the data arrives. Forcing a refresh
+                // before that data exists made SDx's own dataBinding handler
+                // throw "Cannot read properties of undefined (reading 'length')".
                 return {
                     success: true,
                     message: `Applied page size through Kendo grid data source: ${pageSize}`
@@ -733,9 +916,7 @@
                 if (typeof pagerWidget.dataSource.page === 'function') {
                     pagerWidget.dataSource.page(1);
                 }
-                if (typeof pagerWidget.refresh === 'function') {
-                    pagerWidget.refresh();
-                }
+                // As above: the data source change refreshes the pager itself.
                 return {
                     success: true,
                     message: `Applied page size through Kendo pager data source: ${pageSize}`
@@ -1165,6 +1346,210 @@
             .sdx-qol-dl-panel .sdx-actions button {
                 flex: 0 0 auto !important;
             }
+            .sdx-qol-pv-btn {
+                display: inline-flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                width: 18px !important;
+                height: 18px !important;
+                margin-left: 5px !important;
+                vertical-align: middle !important;
+                border-radius: 3px !important;
+                cursor: pointer !important;
+                color: #1a5fb4 !important;
+                opacity: 0.75 !important;
+            }
+            .sdx-qol-pv-btn:hover {
+                opacity: 1 !important;
+                background: #dbe8fa !important;
+            }
+            .sdx-qol-pv-btn.sdx-qol-pv-active {
+                background: #1a73e8 !important;
+                color: #ffffff !important;
+                opacity: 1 !important;
+            }
+            .sdx-qol-pv-btn svg {
+                width: 14px !important;
+                height: 14px !important;
+                pointer-events: none !important;
+            }
+            .sdx-qol-pv-panel {
+                position: fixed !important;
+                top: 50% !important;
+                left: 50% !important;
+                transform: translate(-50%, -50%) !important;
+                z-index: 999997 !important;
+                width: 82vw !important;
+                height: 90vh !important;
+                display: flex !important;
+                flex-direction: column !important;
+                background: #ffffff !important;
+                color: #222222 !important;
+                border-radius: 6px !important;
+                box-shadow: 0 6px 24px rgba(0,0,0,0.45) !important;
+                font: 13px Arial, sans-serif !important;
+                overflow: hidden !important;
+            }
+            .sdx-qol-pv-header {
+                display: flex !important;
+                align-items: center !important;
+                gap: 8px !important;
+                padding: 8px 12px !important;
+                background: #f3f3f3 !important;
+                border-bottom: 1px solid #d5d5d5 !important;
+            }
+            .sdx-qol-pv-title {
+                flex: 1 1 auto !important;
+                font-weight: bold !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+                white-space: nowrap !important;
+            }
+            .sdx-qol-pv-header button {
+                flex: 0 0 auto !important;
+                padding: 4px 10px !important;
+                border: 1px solid #aaaaaa !important;
+                border-radius: 4px !important;
+                background: #ffffff !important;
+                cursor: pointer !important;
+                font: 12px Arial, sans-serif !important;
+            }
+            .sdx-qol-pv-counter {
+                flex: 0 0 auto !important;
+                color: #666666 !important;
+                font-size: 12px !important;
+            }
+            .sdx-qol-pv-nav {
+                position: absolute !important;
+                top: 50% !important;
+                transform: translateY(-50%) !important;
+                z-index: 3 !important;
+                width: 38px !important;
+                height: 64px !important;
+                padding: 0 0 4px 0 !important;
+                border: none !important;
+                border-radius: 6px !important;
+                background: rgba(30,30,30,0.55) !important;
+                color: #ffffff !important;
+                font: 34px/60px Arial, sans-serif !important;
+                cursor: pointer !important;
+            }
+            .sdx-qol-pv-nav:hover:not(:disabled) {
+                background: rgba(30,30,30,0.85) !important;
+            }
+            .sdx-qol-pv-nav:disabled {
+                opacity: 0.2 !important;
+                cursor: default !important;
+            }
+            .sdx-qol-pv-nav-prev { left: 10px !important; }
+            .sdx-qol-pv-nav-next { right: 24px !important; }
+            .sdx-qol-pv-scroll {
+                position: absolute !important;
+                inset: 0 !important;
+                overflow: auto !important;
+                padding: 12px 0 !important;
+                box-sizing: border-box !important;
+                background: #525659 !important;
+            }
+            .sdx-qol-pv-page {
+                position: relative !important;
+                margin: 0 auto 12px auto !important;
+                background: #ffffff !important;
+                box-shadow: 0 1px 6px rgba(0,0,0,0.5) !important;
+            }
+            .sdx-qol-pv-search {
+                flex: 0 0 auto !important;
+                display: flex;
+                align-items: center !important;
+                gap: 4px !important;
+            }
+            .sdx-qol-pv-search input {
+                width: 150px !important;
+                padding: 3px 6px !important;
+                border: 1px solid #aaaaaa !important;
+                border-radius: 4px !important;
+                font: 12px Arial, sans-serif !important;
+            }
+            .sdx-qol-pv-text {
+                position: absolute !important;
+                inset: 0 !important;
+                overflow: hidden !important;
+                line-height: 1 !important;
+                text-size-adjust: none !important;
+                transform-origin: 0 0 !important;
+            }
+            .sdx-qol-pv-text span,
+            .sdx-qol-pv-text br {
+                color: transparent !important;
+                position: absolute !important;
+                white-space: pre !important;
+                cursor: text !important;
+                transform-origin: 0% 0% !important;
+                margin: 0 !important;
+                padding: 0 !important;
+                border: 0 !important;
+                letter-spacing: normal !important;
+                word-spacing: normal !important;
+                text-indent: 0 !important;
+                text-transform: none !important;
+            }
+            /* PDF.js wraps text in "marked content" spans for tagged PDFs
+               (common in CAD output). They must not offset their children. */
+            .sdx-qol-pv-text .markedContent {
+                top: 0 !important;
+                height: 0 !important;
+            }
+            .sdx-qol-pv-text span[role="img"] {
+                user-select: none !important;
+                cursor: default !important;
+            }
+            .sdx-qol-pv-text ::selection {
+                background: rgba(0, 100, 255, 0.35) !important;
+            }
+            .sdx-qol-pv-hl {
+                position: absolute !important;
+                inset: 0 !important;
+                pointer-events: none !important;
+                overflow: hidden !important;
+            }
+            .sdx-qol-pv-hl-box {
+                position: absolute !important;
+                background: rgba(255, 213, 0, 0.5) !important;
+                mix-blend-mode: multiply !important;
+                border-radius: 2px !important;
+            }
+            .sdx-qol-pv-hl-box.sdx-qol-pv-hl-current {
+                background: rgba(255, 120, 0, 0.7) !important;
+                outline: 1px solid rgba(200, 80, 0, 0.9) !important;
+            }
+            .sdx-qol-pv-header button.sdx-qol-pv-fit-active {
+                background: #1a73e8 !important;
+                border-color: #1a73e8 !important;
+                color: #ffffff !important;
+            }
+            .sdx-qol-pv-body {
+                position: relative !important;
+                flex: 1 1 auto !important;
+                min-height: 0 !important;
+                background: #525659 !important;
+            }
+            .sdx-qol-pv-body iframe {
+                width: 100% !important;
+                height: 100% !important;
+                border: 0 !important;
+                background: #525659 !important;
+            }
+            .sdx-qol-pv-status {
+                position: absolute !important;
+                inset: 0 !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                text-align: center !important;
+                padding: 20px !important;
+                color: #ffffff !important;
+                font: 14px Arial, sans-serif !important;
+            }
             .sdx-qol-dl-name-input {
                 width: 100% !important;
                 margin-top: 4px !important;
@@ -1287,6 +1672,15 @@
         });
         tabs.appendChild(columnsTab);
         tabs.appendChild(rowsTab);
+        const viewerTab = document.createElement('button');
+        viewerTab.type = 'button';
+        viewerTab.className = `sdx-tab ${activeTab === 'viewer' ? 'active' : ''}`;
+        viewerTab.textContent = 'PDF Viewer';
+        viewerTab.addEventListener('click', function () {
+            activeTab = 'viewer';
+            renderManagerMenu(menu, button);
+        });
+        tabs.appendChild(viewerTab);
         if (isTodoList) {
             const highlightsTab = document.createElement('button');
             highlightsTab.type = 'button';
@@ -1303,6 +1697,8 @@
             renderColumnsTab(menu);
         } else if (activeTab === 'rows') {
             renderRowsTab(menu);
+        } else if (activeTab === 'viewer') {
+            renderViewerTab(menu);
         } else {
             renderHighlightsTab(menu);
         }
@@ -1332,6 +1728,14 @@
                 lastAppliedPageSize = null;
                 const tempStatus = document.createElement('div');
                 applySdxPageSize(100, tempStatus);
+                renderManagerMenu(menu, button);
+            });
+        } else if (activeTab === 'viewer') {
+            reset.textContent = 'Reset Viewer';
+            reset.addEventListener('click', function () {
+                saveViewerSettings(getDefaultViewerSettings());
+                applyViewerEnabled(true);
+                pvEnforceCacheLimit();
                 renderManagerMenu(menu, button);
             });
         } else {
@@ -1496,6 +1900,140 @@
         control.appendChild(status);
         control.appendChild(caution);
         menu.appendChild(control);
+    }
+    function formatBytes(bytes) {
+        if (!bytes) return '0 MB';
+        const mb = bytes / (1024 * 1024);
+        return mb < 0.1 ? '<0.1 MB' : `${mb.toFixed(1)} MB`;
+    }
+    function renderViewerTab(menu) {
+        const settings = loadViewerSettings();
+        const note = document.createElement('div');
+        note.className = 'sdx-subtitle';
+        note.textContent = 'PDF preview (eye icon beside document names). Saves automatically.';
+        menu.appendChild(note);
+        // --- 1. On/off switch ---
+        const enabledLabel = document.createElement('label');
+        enabledLabel.className = 'sdx-item';
+        const enabledCb = document.createElement('input');
+        enabledCb.type = 'checkbox';
+        enabledCb.checked = settings.enabled;
+        const enabledSpan = document.createElement('span');
+        enabledSpan.textContent = 'Enable PDF preview';
+        enabledCb.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.enabled = enabledCb.checked;
+            saveViewerSettings(s);
+            applyViewerEnabled(s.enabled);
+            updateStats();
+        });
+        enabledLabel.appendChild(enabledCb);
+        enabledLabel.appendChild(enabledSpan);
+        menu.appendChild(enabledLabel);
+        const enabledNote = document.createElement('div');
+        enabledNote.className = 'sdx-note';
+        enabledNote.textContent = 'Turn off to remove the eye icons and free any cached PDFs (e.g. if you run into a problem with the viewer).';
+        menu.appendChild(enabledNote);
+        // --- 2. Default page view ---
+        const viewSection = document.createElement('div');
+        viewSection.className = 'sdx-section';
+        const viewLabel = document.createElement('label');
+        viewLabel.textContent = 'Default page view ';
+        const viewSelect = document.createElement('select');
+        [['Fit', 'Fit to page'], ['FitH', 'Fit to width']].forEach(([value, text]) => {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            if (settings.view === value) opt.selected = true;
+            viewSelect.appendChild(opt);
+        });
+        viewSelect.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.view = viewSelect.value === 'FitH' ? 'FitH' : 'Fit';
+            saveViewerSettings(s);
+        });
+        viewLabel.appendChild(viewSelect);
+        const viewNote = document.createElement('div');
+        viewNote.className = 'sdx-note';
+        viewNote.textContent = 'Applies the next time a PDF opens in the viewer.';
+        viewSection.appendChild(viewLabel);
+        viewSection.appendChild(viewNote);
+        menu.appendChild(viewSection);
+        // --- Viewer engine ---
+        const engineSection = document.createElement('div');
+        engineSection.className = 'sdx-section';
+        const engineLabel = document.createElement('label');
+        engineLabel.textContent = 'Viewer ';
+        const engineSelect = document.createElement('select');
+        [['pdfjs', 'Enhanced (same in Chrome & Edge)'], ['native', 'Browser built-in']].forEach(([value, text]) => {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            if (settings.engine === value) opt.selected = true;
+            engineSelect.appendChild(opt);
+        });
+        engineSelect.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.engine = engineSelect.value === 'native' ? 'native' : 'pdfjs';
+            saveViewerSettings(s);
+        });
+        engineLabel.appendChild(engineSelect);
+        const engineNote = document.createElement('div');
+        engineNote.className = 'sdx-note';
+        engineNote.textContent = 'Enhanced always honors Fit page / Fit width and adds zoom controls. The browser built-in viewer has search, print and download but Edge ignores the fit setting. Applies to the next PDF opened.';
+        engineSection.appendChild(engineLabel);
+        engineSection.appendChild(engineNote);
+        menu.appendChild(engineSection);
+        // --- 3. Cache size + purge ---
+        const cacheSection = document.createElement('div');
+        cacheSection.className = 'sdx-section';
+        const cacheLabel = document.createElement('div');
+        cacheLabel.style.marginBottom = '4px';
+        const slider = document.createElement('input');
+        slider.type = 'range';
+        slider.min = '0';
+        slider.max = '100';
+        slider.step = '1';
+        slider.value = String(settings.cacheMax);
+        slider.style.width = '100%';
+        function updateCacheLabel() {
+            cacheLabel.textContent = `PDFs kept in memory: ${slider.value}${slider.value === '0' ? ' (caching off)' : ''}`;
+        }
+        updateCacheLabel();
+        const cacheNote = document.createElement('div');
+        cacheNote.className = 'sdx-note';
+        cacheNote.textContent = 'The higher the number, the more memory your browser uses. Cached PDFs reopen instantly; large drawings can be several MB each.';
+        const stats = document.createElement('div');
+        stats.className = 'sdx-note';
+        function updateStats() {
+            const st = pvGetCacheStats();
+            stats.textContent = `Currently cached: ${st.count} PDF${st.count === 1 ? '' : 's'} (${formatBytes(st.bytes)})`;
+        }
+        updateStats();
+        slider.addEventListener('input', updateCacheLabel);
+        slider.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.cacheMax = Number(slider.value);
+            saveViewerSettings(s);
+            pvEnforceCacheLimit();
+            updateStats();
+        });
+        const purgeBtn = document.createElement('button');
+        purgeBtn.type = 'button';
+        purgeBtn.textContent = 'Purge all';
+        purgeBtn.addEventListener('click', function () {
+            pvPurgeCache();
+            updateStats();
+        });
+        const purgeLine = document.createElement('div');
+        purgeLine.style.marginTop = '6px';
+        purgeLine.appendChild(purgeBtn);
+        cacheSection.appendChild(cacheLabel);
+        cacheSection.appendChild(slider);
+        cacheSection.appendChild(cacheNote);
+        cacheSection.appendChild(stats);
+        cacheSection.appendChild(purgeLine);
+        menu.appendChild(cacheSection);
     }
     function renderHighlightsTab(menu) {
         const settings = loadSettings();
@@ -1771,7 +2309,10 @@
     // people and should not assume one exact key name from one browser/Okta
     // config. This is SDx's own frontend session token - no dependency on any
     // other userscript being installed.
-    function getTokenFromNativeSessionStorage() {
+    // Returns EVERY token found under an "auth" sessionStorage key (not just
+    // the first), so getSdxAuthToken() can pick the freshest one.
+    function getAllTokensFromSessionStorage() {
+        const found = [];
         try {
             for (let i = 0; i < sessionStorage.length; i++) {
                 const key = sessionStorage.key(i);
@@ -1783,17 +2324,29 @@
                     const candidate = parsed && (parsed.authorization || parsed.Authorization || parsed.accessToken || parsed.access_token || parsed.token);
                     if (typeof candidate === 'string') {
                         const stripped = stripBearerPrefix(candidate);
-                        if (looksLikeJwt(stripped)) return stripped;
+                        if (looksLikeJwt(stripped)) found.push(stripped);
                     }
                 } catch (innerErr) {
                     const stripped = stripBearerPrefix(raw);
-                    if (looksLikeJwt(stripped)) return stripped;
+                    if (looksLikeJwt(stripped)) found.push(stripped);
                 }
             }
         } catch (err) {
-            console.warn('SDx QoL: getTokenFromNativeSessionStorage failed', err);
+            console.warn('SDx QoL: getAllTokensFromSessionStorage failed', err);
         }
-        return null;
+        return found;
+    }
+    // Expiry (ms since epoch) from a JWT's "exp" claim, or 0 if unreadable.
+    function jwtExpiryMs(token) {
+        try {
+            const part = String(token).split('.')[1];
+            const b64 = part.replace(/-/g, '+').replace(/_/g, '/');
+            const json = atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, '='));
+            const exp = Number(JSON.parse(json).exp);
+            return Number.isFinite(exp) ? exp * 1000 : 0;
+        } catch (err) {
+            return 0;
+        }
     }
     // Defensive fallback only - some users also run a separate "SDx Add
     // Reviewer" userscript that caches its own auth headers here.
@@ -1812,8 +2365,28 @@
         }
         return null;
     }
+    // Picks the token with the LATEST expiry among every source we can see:
+    // all sessionStorage auth entries, the most recent token SDx itself sent
+    // on a request (captured by Module 0's passive header watcher), and the
+    // Reviewer Wizard cache. SDx renews its token during a session; relying
+    // on whichever source happened to come first meant a stale, expired token
+    // could be used, which the server rejects with HTTP 401.
     function getSdxAuthToken() {
-        return getTokenFromNativeSessionStorage() || getTokenFromReviewerWizard() || null;
+        const candidates = [
+            ...getAllTokensFromSessionStorage(),
+            capturedAuthToken,
+            getTokenFromReviewerWizard()
+        ].filter(Boolean);
+        let best = null;
+        let bestExp = -1;
+        candidates.forEach(token => {
+            const exp = jwtExpiryMs(token);
+            if (exp > bestExp) {
+                best = token;
+                bestExp = exp;
+            }
+        });
+        return best;
     }
     function getSdaApiBase() {
         return `${location.origin}/ENR01Server/api/v2/SDA`;
@@ -2322,6 +2895,1006 @@
         setTimeout(injectDlFilesButton, 0);
     }, true);
     //////////////////////////////////////////////////////////////////////
+    // MODULE 3K
+    // PDF PREVIEW (small icon beside each document name)
+    //////////////////////////////////////////////////////////////////////
+    // Flow confirmed via live network capture of SDx's own "open file" click:
+    //   1. GET  Objects('<docOBID>')/SPFFileComposition_21?$filter=SPFViewInd eq true&$top=1
+    //        -> value[0].OBID is the viewable FILE's OBID
+    //   2. POST Files('<fileOBID>')/...RetrieveFileUris
+    //        body { purposes: ['Markup'], downloadFile: false }
+    //        -> value[0].Uri is a same-origin /SPFViewDir/... PDF URL
+    //   3. The PDF itself loads in the new tab with no Authorization header
+    //      (session cookie), so we fetch it the same way and show it in an
+    //      iframe via a blob: URL.
+    // Nothing is fetched until the user clicks an icon, so this adds zero
+    // background network load.
+    const PV_BTN_CLASS = 'sdx-qol-pv-btn';
+    const PV_MODAL_ID = 'sdx-qol-pv-modal';
+    const PV_ACTIVE_CLASS = 'sdx-qol-pv-active';
+    const VIEWER_SETTINGS_KEY = `${STORAGE_PREFIX}:viewer`;
+    // Viewer settings are global (not per list): on/off switch, default PDF
+    // zoom ('Fit' = fit to page, 'FitH' = fit to width), and how many PDFs to
+    // keep in memory (0-100).
+    // engine: 'pdfjs' = our own PDF.js-based viewer (identical in Chrome and
+    // Edge; fit page/width always honored), 'native' = the browser's built-in
+    // PDF viewer in an iframe (Edge's ignores the fit setting).
+    function getDefaultViewerSettings() {
+        return { enabled: true, view: 'Fit', cacheMax: 5, engine: 'pdfjs' };
+    }
+    function loadViewerSettings() {
+        const defaults = getDefaultViewerSettings();
+        try {
+            const raw = localStorage.getItem(VIEWER_SETTINGS_KEY);
+            if (!raw) return defaults;
+            const parsed = JSON.parse(raw) || {};
+            const cacheMax = Number(parsed.cacheMax);
+            return {
+                enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : defaults.enabled,
+                view: parsed.view === 'FitH' ? 'FitH' : 'Fit',
+                cacheMax: Number.isFinite(cacheMax) ? Math.min(100, Math.max(0, Math.round(cacheMax))) : defaults.cacheMax,
+                engine: parsed.engine === 'native' ? 'native' : 'pdfjs'
+            };
+        } catch (err) {
+            return defaults;
+        }
+    }
+    function saveViewerSettings(settings) {
+        try {
+            localStorage.setItem(VIEWER_SETTINGS_KEY, JSON.stringify({
+                enabled: Boolean(settings.enabled),
+                view: settings.view === 'FitH' ? 'FitH' : 'Fit',
+                cacheMax: Math.min(100, Math.max(0, Math.round(Number(settings.cacheMax) || 0))),
+                engine: settings.engine === 'native' ? 'native' : 'pdfjs'
+            }));
+        } catch (err) {
+            console.warn('SDx QoL: could not save viewer settings', err);
+        }
+    }
+    const pvBlobCache = new Map(); // fileObid -> { blobUrl, fileName, size }
+    let pvRequestCounter = 0;
+    let pvCurrentObid = null;
+    let pvLastObid = null; // last document opened - stays highlighted after the viewer closes
+    let pvActiveUi = null; // UI handles of the currently open viewer
+    let pvEscHandler = null;
+    let pvActiveBlobUrl = null;
+    const PV_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+    // Blue-highlights the eye icon of the last-opened document so the user
+    // can still find their place in the list after closing the viewer.
+    function pvRefreshActiveHighlight() {
+        document.querySelectorAll('.' + PV_BTN_CLASS).forEach(btn => {
+            const active = pvLastObid !== null && btn.dataset.obid === pvLastObid;
+            if (btn.classList.contains(PV_ACTIVE_CLASS) !== active) {
+                btn.classList.toggle(PV_ACTIVE_CLASS, active);
+            }
+        });
+    }
+    // Removes every icon and processed-row marker (used when the feature is
+    // switched off; switching it back on re-injects from scratch).
+    function removeAllPreviewButtons() {
+        document.querySelectorAll('.' + PV_BTN_CLASS).forEach(btn => btn.remove());
+        document.querySelectorAll('[data-sdx-qol-pv]').forEach(row => row.removeAttribute('data-sdx-qol-pv'));
+    }
+    function injectPreviewButtons() {
+        if (!isTopFrame()) return;
+        if (getPageType() === 'todo-list') return;
+        if (!loadViewerSettings().enabled) return;
+        document.querySelectorAll('.k-grid').forEach(gridEl => {
+            const widget = getKendoWidgetFromElement(gridEl, ['kendoGrid']);
+            if (!widget || typeof widget.dataItem !== 'function') return;
+            gridEl.querySelectorAll('tr[data-uid]').forEach(row => {
+                if (row.getAttribute('data-sdx-qol-pv') === '1') return;
+                let item = null;
+                try { item = widget.dataItem(row); } catch (err) { item = null; }
+                if (!item) return;
+                const obid = item.OBID || item.Id;
+                const name = normalizeText(item.Name || item.CI_Name || '');
+                if (!obid || !name) return;
+                // Mark every processed <tr> (even the half with no link) so
+                // later refresh passes skip it cheaply.
+                row.setAttribute('data-sdx-qol-pv', '1');
+                // Locked/frozen columns split one data row into two <tr>s, so
+                // only the half that actually holds the name link gets the icon.
+                // Confirmed live: the name is rendered as
+                // <span class="grid-object__name">, not an <a>. Anchors are
+                // kept as a fallback for other grids.
+                const link = [...row.querySelectorAll('.grid-object__name, td a')].find(a => normalizeText(a.textContent) === name);
+                if (!link) return;
+                if (link.parentElement && link.parentElement.querySelector('.' + PV_BTN_CLASS)) return;
+                const btn = document.createElement('span');
+                btn.className = PV_BTN_CLASS;
+                btn.setAttribute('role', 'button');
+                btn.title = 'Preview PDF';
+                btn.innerHTML = PV_ICON_SVG;
+                btn.dataset.obid = obid;
+                btn.dataset.name = name;
+                btn.dataset.config = item.Config || item.SPFConfigUID || '';
+                link.insertAdjacentElement('afterend', btn);
+            });
+        });
+        if (pvLastObid !== null) pvRefreshActiveHighlight();
+    }
+    const schedulePreviewInjection = debounce(injectPreviewButtons, 100);
+    function closePreviewModal() {
+        pvRequestCounter++; // invalidates any in-flight request
+        const existing = document.getElementById(PV_MODAL_ID);
+        if (existing) existing.remove();
+        if (pvEscHandler) {
+            document.removeEventListener('keydown', pvEscHandler, true);
+            pvEscHandler = null;
+        }
+        pvActiveBlobUrl = null;
+        if (pvActiveUi && pvActiveUi.viewer) {
+            try { pvActiveUi.viewer.destroy(); } catch (err) { /* ignore */ }
+        }
+        pvActiveUi = null;
+        // Nothing is on screen now, so anything over the cache limit (e.g.
+        // the just-viewed PDF when the limit is 0) can be released.
+        pvEnforceCacheLimit();
+    }
+    // Evicts the oldest cached PDFs beyond the user's limit, never touching
+    // the one currently being displayed.
+    function pvEnforceCacheLimit() {
+        const max = loadViewerSettings().cacheMax;
+        while (pvBlobCache.size > max) {
+            let victimKey = null;
+            for (const [key, entry] of pvBlobCache) {
+                if (entry.blobUrl !== pvActiveBlobUrl) { victimKey = key; break; }
+            }
+            if (victimKey === null) break;
+            const victim = pvBlobCache.get(victimKey);
+            pvBlobCache.delete(victimKey);
+            try { URL.revokeObjectURL(victim.blobUrl); } catch (err) { /* ignore */ }
+        }
+    }
+    function pvRememberBlob(fileObid, blobUrl, fileName, size, blob) {
+        if (pvBlobCache.has(fileObid)) pvBlobCache.delete(fileObid);
+        pvBlobCache.set(fileObid, { blobUrl, fileName, size: size || 0, blob: blob || null });
+        pvEnforceCacheLimit();
+    }
+    function pvGetCacheStats() {
+        let bytes = 0;
+        pvBlobCache.forEach(entry => { bytes += entry.size || 0; });
+        return { count: pvBlobCache.size, bytes };
+    }
+    // Releases every cached PDF except the one currently on screen (if the
+    // viewer is open). Returns how many were released.
+    function pvPurgeCache() {
+        let released = 0;
+        for (const [key, entry] of [...pvBlobCache]) {
+            if (entry.blobUrl === pvActiveBlobUrl) continue;
+            pvBlobCache.delete(key);
+            try { URL.revokeObjectURL(entry.blobUrl); } catch (err) { /* ignore */ }
+            released++;
+        }
+        return released;
+    }
+    // Chrome/Edge's built-in PDF viewer reads "open parameters" from the URL
+    // fragment. 'Fit' = fit to page, 'FitH' = fit to width. The view param
+    // goes first, and the zoom alias is included as a harmless extra: a
+    // non-numeric zoom is simply ignored by builds that don't understand it.
+    function pvViewHash(mode) {
+        const fitH = (mode || loadViewerSettings().view) === 'FitH';
+        return fitH
+            ? '#view=FitH&zoom=page-width&navpanes=0'
+            : '#view=Fit&zoom=page-fit&navpanes=0';
+    }
+    // Applies a change to the on/off switch right away.
+    function applyViewerEnabled(enabled) {
+        if (enabled) {
+            injectPreviewButtons();
+        } else {
+            closePreviewModal();
+            removeAllPreviewButtons();
+            pvPurgeCache();
+        }
+    }
+    function buildPreviewModal(title) {
+        closePreviewModal();
+        const modal = document.createElement('div');
+        modal.id = PV_MODAL_ID;
+        const backdrop = document.createElement('div');
+        backdrop.className = 'sdx-qol-dl-backdrop';
+        backdrop.addEventListener('click', closePreviewModal);
+        const panel = document.createElement('div');
+        panel.className = 'sdx-qol-pv-panel';
+        const header = document.createElement('div');
+        header.className = 'sdx-qol-pv-header';
+        const titleEl = document.createElement('div');
+        titleEl.className = 'sdx-qol-pv-title';
+        titleEl.textContent = title;
+        const counterEl = document.createElement('div');
+        counterEl.className = 'sdx-qol-pv-counter';
+        const pageEl = document.createElement('div');
+        pageEl.className = 'sdx-qol-pv-counter';
+        pageEl.style.display = 'none';
+        // Search box (Enhanced viewer only).
+        const searchWrap = document.createElement('div');
+        searchWrap.className = 'sdx-qol-pv-search';
+        searchWrap.style.display = 'none';
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.placeholder = 'Find in PDF (Enter)';
+        const searchPrev = document.createElement('button');
+        searchPrev.type = 'button';
+        searchPrev.textContent = '↑';
+        searchPrev.title = 'Previous match';
+        const searchNext = document.createElement('button');
+        searchNext.type = 'button';
+        searchNext.textContent = '↓';
+        searchNext.title = 'Next match';
+        const searchCount = document.createElement('span');
+        searchCount.className = 'sdx-qol-pv-counter';
+        function runSearch(dir) {
+            if (pvActiveUi && pvActiveUi.viewer) pvActiveUi.viewer.search(searchInput.value, dir);
+        }
+        searchInput.addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                runSearch(e.shiftKey ? -1 : 1);
+            }
+        });
+        searchPrev.addEventListener('click', function () { runSearch(-1); });
+        searchNext.addEventListener('click', function () { runSearch(1); });
+        searchWrap.appendChild(searchInput);
+        searchWrap.appendChild(searchPrev);
+        searchWrap.appendChild(searchNext);
+        searchWrap.appendChild(searchCount);
+        const downloadBtn = document.createElement('button');
+        downloadBtn.type = 'button';
+        downloadBtn.textContent = 'Download';
+        downloadBtn.title = 'Save this PDF';
+        downloadBtn.style.display = 'none';
+        const printBtn = document.createElement('button');
+        printBtn.type = 'button';
+        printBtn.textContent = 'Print';
+        printBtn.title = 'Print this PDF';
+        printBtn.style.display = 'none';
+        const zoomOutBtn = document.createElement('button');
+        zoomOutBtn.type = 'button';
+        zoomOutBtn.textContent = '−';
+        zoomOutBtn.title = 'Zoom out';
+        zoomOutBtn.style.display = 'none';
+        zoomOutBtn.addEventListener('click', function () { pvZoom(1 / 1.25); });
+        const zoomInBtn = document.createElement('button');
+        zoomInBtn.type = 'button';
+        zoomInBtn.textContent = '+';
+        zoomInBtn.title = 'Zoom in';
+        zoomInBtn.style.display = 'none';
+        zoomInBtn.addEventListener('click', function () { pvZoom(1.25); });
+        const fitPageBtn = document.createElement('button');
+        fitPageBtn.type = 'button';
+        fitPageBtn.textContent = 'Fit page';
+        fitPageBtn.title = 'Show whole page';
+        fitPageBtn.style.display = 'none';
+        fitPageBtn.addEventListener('click', function () { pvSetFitMode('Fit'); });
+        const fitWidthBtn = document.createElement('button');
+        fitWidthBtn.type = 'button';
+        fitWidthBtn.textContent = 'Fit width';
+        fitWidthBtn.title = 'Fit page to viewer width';
+        fitWidthBtn.style.display = 'none';
+        fitWidthBtn.addEventListener('click', function () { pvSetFitMode('FitH'); });
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.textContent = 'Open in new tab';
+        openBtn.style.display = 'none';
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.textContent = 'Close';
+        closeBtn.addEventListener('click', closePreviewModal);
+        header.appendChild(titleEl);
+        header.appendChild(counterEl);
+        header.appendChild(pageEl);
+        header.appendChild(searchWrap);
+        header.appendChild(zoomOutBtn);
+        header.appendChild(zoomInBtn);
+        header.appendChild(fitPageBtn);
+        header.appendChild(fitWidthBtn);
+        header.appendChild(downloadBtn);
+        header.appendChild(printBtn);
+        header.appendChild(openBtn);
+        header.appendChild(closeBtn);
+        const body = document.createElement('div');
+        body.className = 'sdx-qol-pv-body';
+        const status = document.createElement('div');
+        status.className = 'sdx-qol-pv-status';
+        body.appendChild(status);
+        // Previous / next document arrows (follow the list's current order).
+        const prevBtn = document.createElement('button');
+        prevBtn.type = 'button';
+        prevBtn.className = 'sdx-qol-pv-nav sdx-qol-pv-nav-prev';
+        prevBtn.title = 'Previous document in list (Left arrow)';
+        prevBtn.textContent = '‹';
+        prevBtn.addEventListener('click', function () { pvNavigate(-1); });
+        const nextBtn = document.createElement('button');
+        nextBtn.type = 'button';
+        nextBtn.className = 'sdx-qol-pv-nav sdx-qol-pv-nav-next';
+        nextBtn.title = 'Next document in list (Right arrow)';
+        nextBtn.textContent = '›';
+        nextBtn.addEventListener('click', function () { pvNavigate(1); });
+        body.appendChild(prevBtn);
+        body.appendChild(nextBtn);
+        panel.appendChild(header);
+        panel.appendChild(body);
+        modal.appendChild(backdrop);
+        modal.appendChild(panel);
+        document.body.appendChild(modal);
+        // Fires only when focus is in the SDx page itself (not inside the PDF
+        // viewer iframe), so it never fights the viewer's own arrow-key paging.
+        pvEscHandler = function (e) {
+            if (e.key === 'Escape') {
+                e.stopPropagation();
+                closePreviewModal();
+            } else if ((e.ctrlKey || e.metaKey) && (e.key === 'f' || e.key === 'F') && pvActiveUi && pvActiveUi.viewer) {
+                // Ctrl+F searches inside the PDF while the Enhanced viewer is open.
+                e.preventDefault();
+                e.stopPropagation();
+                pvActiveUi.searchInput.focus();
+                pvActiveUi.searchInput.select();
+            } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                // Don't hijack arrow keys while typing in the search box.
+                if (isTypingTarget(e.target)) return;
+                e.preventDefault();
+                pvNavigate(e.key === 'ArrowLeft' ? -1 : 1);
+            }
+        };
+        document.addEventListener('keydown', pvEscHandler, true);
+        const ui = { titleEl, counterEl, openBtn, body, status, prevBtn, nextBtn, fitPageBtn, fitWidthBtn, pageEl, zoomOutBtn, zoomInBtn, searchWrap, searchInput, searchCount, downloadBtn, printBtn, blobUrl: null, frame: null, viewer: null };
+        pvActiveUi = ui;
+        return ui;
+    }
+    // The ordered list of previewable documents = the eye icons currently in
+    // the list, in on-screen order. Re-read on every navigation because SDx
+    // may have re-rendered rows (new page, sort, filter) since last time.
+    function pvGetOrderedButtons() {
+        const seen = new Set();
+        const out = [];
+        document.querySelectorAll('.' + PV_BTN_CLASS).forEach(btn => {
+            const id = btn.dataset.obid;
+            if (!id || seen.has(id) || !btn.isConnected) return;
+            seen.add(id);
+            out.push(btn);
+        });
+        return out;
+    }
+    function pvUpdateNav(ui, obid) {
+        const list = pvGetOrderedButtons();
+        const idx = list.findIndex(b => b.dataset.obid === obid);
+        ui.prevBtn.disabled = idx <= 0;
+        ui.nextBtn.disabled = idx < 0 || idx >= list.length - 1;
+        ui.counterEl.textContent = idx >= 0 ? `${idx + 1} of ${list.length}` : '';
+    }
+    function pvNavigate(delta) {
+        const list = pvGetOrderedButtons();
+        const idx = list.findIndex(b => b.dataset.obid === pvCurrentObid);
+        if (idx < 0) return;
+        const target = list[idx + delta];
+        if (!target) return;
+        // Keep the list scrolled so the row being previewed stays in view.
+        try { target.scrollIntoView({ block: 'nearest' }); } catch (err) { /* ignore */ }
+        openPdfPreview(target.dataset.obid, target.dataset.name, target.dataset.config || null);
+    }
+    function pvMarkFitButtons(ui, mode) {
+        ui.fitPageBtn.classList.toggle('sdx-qol-pv-fit-active', mode !== 'FitH');
+        ui.fitWidthBtn.classList.toggle('sdx-qol-pv-fit-active', mode === 'FitH');
+    }
+    // Browser built-in viewer (fallback engine). A brand-new iframe element
+    // is used on every change because changing only the #fragment of an
+    // already-loaded PDF would not make Chrome/Edge re-read open parameters.
+    // Edge's built-in viewer ignores the fit parameters; Chrome's honors them.
+    function pvLoadFrame(ui, mode) {
+        if (!ui.blobUrl) return;
+        if (ui.frame) ui.frame.remove();
+        const src = ui.blobUrl + pvViewHash(mode);
+        const frame = document.createElement('iframe');
+        frame.src = src;
+        ui.body.appendChild(frame);
+        ui.frame = frame;
+        pvMarkFitButtons(ui, mode);
+    }
+    function pvSetFitMode(mode) {
+        const ui = pvActiveUi;
+        if (!ui || !ui.blobUrl) return;
+        // The last mode used becomes the new default, so the setting and the
+        // viewer stay in agreement.
+        const s = loadViewerSettings();
+        s.view = mode === 'FitH' ? 'FitH' : 'Fit';
+        saveViewerSettings(s);
+        if (ui.viewer) {
+            ui.viewer.setMode(s.view);
+            pvMarkFitButtons(ui, s.view);
+        } else {
+            pvLoadFrame(ui, s.view);
+        }
+    }
+    function pvZoom(factor) {
+        if (pvActiveUi && pvActiveUi.viewer) pvActiveUi.viewer.zoomBy(factor);
+    }
+    //////////////////////////////////////////////////////////////////////
+    // PDF.js viewer engine
+    //////////////////////////////////////////////////////////////////////
+    // PDF.js itself is loaded by the @require line in the script header (a
+    // pinned cdnjs version). If it isn't available for any reason - blocked,
+    // an AMD loader on the page swallowed it, etc. - everything silently
+    // falls back to the browser's built-in viewer.
+    const PV_PDFJS_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+    let pvWorkerReady = null;
+    function pvPdfJsAvailable() {
+        return typeof window.pdfjsLib !== 'undefined' && window.pdfjsLib && typeof window.pdfjsLib.getDocument === 'function';
+    }
+    // The PDF.js worker must be same-origin, so fetch it once and run it
+    // from a blob: URL. If that fetch is blocked, point at the CDN URL and
+    // let PDF.js fall back to its own main-thread mode.
+    function pvEnsureWorker() {
+        if (pvWorkerReady) return pvWorkerReady;
+        pvWorkerReady = (async function () {
+            const lib = window.pdfjsLib;
+            if (lib.GlobalWorkerOptions.workerSrc) return;
+            const workerUrl = PV_PDFJS_BASE + 'pdf.worker.min.js';
+            try {
+                const resp = await fetch(workerUrl);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const text = await resp.text();
+                lib.GlobalWorkerOptions.workerSrc = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
+            } catch (err) {
+                console.warn('SDx QoL: could not load PDF.js worker as a blob, using CDN URL', err);
+                lib.GlobalWorkerOptions.workerSrc = workerUrl;
+            }
+        })();
+        return pvWorkerReady;
+    }
+    // Builds a scrollable, lazily-rendered viewer for one PDF inside
+    // ui.body. Pages are drawn only when scrolled near, and re-drawn when
+    // the fit mode, zoom, or window size changes.
+    async function pvCreatePdfJsViewer(ui, blob, initialMode) {
+        const lib = window.pdfjsLib;
+        await pvEnsureWorker();
+        const data = new Uint8Array(await blob.arrayBuffer());
+        const doc = await lib.getDocument({
+            data,
+            cMapUrl: PV_PDFJS_BASE + 'cmaps/',
+            cMapPacked: true,
+            standardFontDataUrl: PV_PDFJS_BASE + 'standard_fonts/'
+        }).promise;
+        let destroyed = false;
+        let gen = 0;
+        let mode = initialMode === 'FitH' ? 'FitH' : 'Fit';
+        let zoom = 1;
+        let renderChain = Promise.resolve();
+        let scroll = null;
+        let io = null;
+        let ro = null;
+        try {
+            const firstPage = await doc.getPage(1);
+            const baseVp = firstPage.getViewport({ scale: 1 });
+            scroll = document.createElement('div');
+            scroll.className = 'sdx-qol-pv-scroll';
+            const wrappers = [];
+            for (let i = 1; i <= doc.numPages; i++) {
+                const el = document.createElement('div');
+                el.className = 'sdx-qol-pv-page';
+                el.dataset.page = String(i);
+                scroll.appendChild(el);
+                wrappers.push({
+                    el,
+                    rendered: false,
+                    task: null,
+                    textTask: null,
+                    textPromise: null,
+                    textStrs: [],
+                    textDivs: [],
+                    ready: Promise.resolve(),
+                    resolveReady: null
+                });
+            }
+            // ---- search state / helpers ----
+            let searchState = { query: '', hits: [], index: -1, token: 0 };
+            // Highlights are drawn as separate overlay boxes sized to just the
+            // matched characters (measured with a DOM Range over the text
+            // layer), not by tinting the whole text run. CAD PDFs often store
+            // a long run of text as one item, so tinting the run put the
+            // highlight far from the word that actually matched.
+            function getOverlay(entry) {
+                let overlay = entry.el.querySelector('.sdx-qol-pv-hl');
+                if (!overlay) {
+                    overlay = document.createElement('div');
+                    overlay.className = 'sdx-qol-pv-hl';
+                    entry.el.appendChild(overlay);
+                }
+                return overlay;
+            }
+            function addMatchBoxes(entry, overlay, textDiv, query, isCurrent) {
+                const node = textDiv.firstChild;
+                if (!node || node.nodeType !== 3) return;
+                const text = String(node.nodeValue).toLowerCase();
+                const wrapRect = entry.el.getBoundingClientRect();
+                let from = 0;
+                let idx;
+                while ((idx = text.indexOf(query, from)) !== -1) {
+                    try {
+                        const range = document.createRange();
+                        range.setStart(node, idx);
+                        range.setEnd(node, Math.min(node.nodeValue.length, idx + query.length));
+                        for (const r of range.getClientRects()) {
+                            if (r.width <= 0 || r.height <= 0) continue;
+                            const box = document.createElement('div');
+                            box.className = isCurrent ? 'sdx-qol-pv-hl-box sdx-qol-pv-hl-current' : 'sdx-qol-pv-hl-box';
+                            box.style.left = `${r.left - wrapRect.left}px`;
+                            box.style.top = `${r.top - wrapRect.top}px`;
+                            box.style.width = `${r.width}px`;
+                            box.style.height = `${r.height}px`;
+                            overlay.appendChild(box);
+                        }
+                    } catch (err) { /* ignore a bad range */ }
+                    from = idx + Math.max(1, query.length);
+                }
+            }
+            // Redraws this page's highlight boxes. currentRun = index (within
+            // textStrs) of the run holding the active match, or -1.
+            function applyHighlights(entry, currentRun) {
+                const overlay = getOverlay(entry);
+                overlay.textContent = '';
+                entry.currentRun = typeof currentRun === 'number' ? currentRun : -1;
+                const q = searchState.query;
+                if (!q) return;
+                entry.textStrs.forEach((s, i) => {
+                    const d = entry.textDivs[i];
+                    if (!d || !String(s).toLowerCase().includes(q)) return;
+                    addMatchBoxes(entry, overlay, d, q, i === entry.currentRun);
+                });
+            }
+            function markCurrentHit() {
+                // Drop the "current" colour from any other page first.
+                wrappers.forEach(other => {
+                    if (other.currentRun !== undefined && other.currentRun >= 0) applyHighlights(other, -1);
+                });
+                const hit = searchState.hits[searchState.index];
+                if (!hit) return;
+                const entry = wrappers[hit.page];
+                let n = 0;
+                for (let i = 0; i < entry.textStrs.length; i++) {
+                    if (String(entry.textStrs[i]).toLowerCase().includes(searchState.query)) {
+                        if (n === hit.k) {
+                            applyHighlights(entry, i);
+                            const box = entry.el.querySelector('.sdx-qol-pv-hl-current');
+                            if (box) {
+                                try { box.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (err) { /* ignore */ }
+                            }
+                            break;
+                        }
+                        n++;
+                    }
+                }
+            }
+            ui.body.appendChild(scroll);
+            function scaleFor(w, h) {
+                const cw = Math.max(50, scroll.clientWidth - 24);
+                const ch = Math.max(50, scroll.clientHeight - 24);
+                const fit = mode === 'FitH' ? cw / w : Math.min(cw / w, ch / h);
+                return fit * zoom;
+            }
+            async function renderPage(entry, index, myGen) {
+                const done = entry.resolveReady;
+                try {
+                    await renderPageInner(entry, index, myGen);
+                } finally {
+                    if (done) done();
+                }
+            }
+            async function renderPageInner(entry, index, myGen) {
+                if (destroyed || myGen !== gen || entry.rendered) return;
+                const page = await doc.getPage(index + 1);
+                if (destroyed || myGen !== gen) return;
+                const base = page.getViewport({ scale: 1 });
+                const vp = page.getViewport({ scale: scaleFor(base.width, base.height) });
+                let outScale = window.devicePixelRatio || 1;
+                // Cap canvas size so huge drawings at high zoom can't exhaust memory.
+                if (vp.width * vp.height * outScale * outScale > 16e6) {
+                    outScale = Math.max(0.5, Math.sqrt(16e6 / (vp.width * vp.height)));
+                }
+                const canvas = document.createElement('canvas');
+                canvas.width = Math.max(1, Math.floor(vp.width * outScale));
+                canvas.height = Math.max(1, Math.floor(vp.height * outScale));
+                canvas.style.width = `${Math.floor(vp.width)}px`;
+                canvas.style.height = `${Math.floor(vp.height)}px`;
+                canvas.style.display = 'block';
+                entry.el.style.width = canvas.style.width;
+                entry.el.style.height = canvas.style.height;
+                entry.rendered = true;
+                const task = page.render({
+                    canvasContext: canvas.getContext('2d'),
+                    viewport: vp,
+                    transform: outScale !== 1 ? [outScale, 0, 0, outScale, 0, 0] : null
+                });
+                entry.task = task;
+                try {
+                    await task.promise;
+                    if (destroyed || myGen !== gen) return;
+                    entry.el.appendChild(canvas);
+                    // Selectable/searchable text on top of the canvas. Failure
+                    // here only costs select/search for this page.
+                    try {
+                        const textDiv = document.createElement('div');
+                        // 'textLayer' is the class PDF.js itself expects on this container.
+                        textDiv.className = 'textLayer sdx-qol-pv-text';
+                        textDiv.style.setProperty('--scale-factor', String(vp.scale));
+                        entry.el.appendChild(textDiv);
+                        entry.textStrs = [];
+                        entry.textDivs = [];
+                        const textTask = lib.renderTextLayer({
+                            textContentSource: page.streamTextContent(),
+                            container: textDiv,
+                            viewport: vp,
+                            textDivs: entry.textDivs,
+                            textContentItemsStr: entry.textStrs
+                        });
+                        entry.textTask = textTask;
+                        entry.textPromise = textTask.promise
+                            .then(() => {
+                                if (!destroyed && myGen === gen) applyHighlights(entry);
+                            })
+                            .catch(() => {});
+                    } catch (textErr) {
+                        console.warn('SDx QoL: PDF.js text layer failed for a page', textErr);
+                    }
+                } catch (err) {
+                    if (!err || err.name !== 'RenderingCancelledException') {
+                        console.warn('SDx QoL: PDF.js page render failed', err);
+                    }
+                } finally {
+                    entry.task = null;
+                }
+            }
+            io = new IntersectionObserver(function (items) {
+                items.forEach(item => {
+                    if (!item.isIntersecting) return;
+                    const index = Number(item.target.dataset.page) - 1;
+                    const entry = wrappers[index];
+                    const myGen = gen;
+                    renderChain = renderChain.then(() => renderPage(entry, index, myGen)).catch(() => {});
+                });
+            }, { root: scroll, rootMargin: '300px 0px' });
+            function updatePageLabel() {
+                if (destroyed) return;
+                const sr = scroll.getBoundingClientRect();
+                const mid = sr.top + sr.height / 2;
+                let current = 1;
+                for (let i = 0; i < wrappers.length; i++) {
+                    if (wrappers[i].el.getBoundingClientRect().top <= mid) current = i + 1;
+                    else break;
+                }
+                ui.pageEl.textContent = `Page ${current} / ${doc.numPages}`;
+            }
+            function layout() {
+                gen++;
+                const s = scaleFor(baseVp.width, baseVp.height);
+                wrappers.forEach(entry => {
+                    if (entry.task) {
+                        try { entry.task.cancel(); } catch (err) { /* ignore */ }
+                    }
+                    if (entry.textTask) {
+                        try { entry.textTask.cancel(); } catch (err) { /* ignore */ }
+                    }
+                    entry.rendered = false;
+                    entry.textTask = null;
+                    entry.textPromise = null;
+                    entry.textStrs = [];
+                    entry.textDivs = [];
+                    entry.el.textContent = ''; // removes canvas + text layer
+                    // Release anyone still waiting on the previous render.
+                    if (entry.resolveReady) entry.resolveReady();
+                    entry.ready = new Promise(resolve => { entry.resolveReady = resolve; });
+                    entry.el.style.width = `${Math.floor(baseVp.width * s)}px`;
+                    entry.el.style.height = `${Math.floor(baseVp.height * s)}px`;
+                });
+                io.disconnect();
+                wrappers.forEach(entry => io.observe(entry.el));
+                updatePageLabel();
+            }
+            let scrollQueued = false;
+            scroll.addEventListener('scroll', function () {
+                if (scrollQueued) return;
+                scrollQueued = true;
+                requestAnimationFrame(function () {
+                    scrollQueued = false;
+                    updatePageLabel();
+                });
+            });
+            let lastW = 0;
+            let lastH = 0;
+            let resizeTimer = null;
+            ro = new ResizeObserver(function () {
+                if (destroyed) return;
+                const w = scroll.clientWidth;
+                const h = scroll.clientHeight;
+                if (w === lastW && h === lastH) return;
+                const first = lastW === 0 && lastH === 0;
+                lastW = w;
+                lastH = h;
+                if (first) return;
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(layout, 150);
+            });
+            ro.observe(scroll);
+            layout();
+            return {
+                setMode(newMode) {
+                    mode = newMode === 'FitH' ? 'FitH' : 'Fit';
+                    zoom = 1;
+                    layout();
+                    scroll.scrollTop = 0;
+                },
+                zoomBy(factor) {
+                    zoom = Math.min(8, Math.max(0.25, zoom * factor));
+                    layout();
+                },
+                // Find text. A new query jumps to the first match; repeating the
+                // same query steps forward (dir = 1) or back (dir = -1).
+                async search(rawQuery, dir) {
+                    const q = String(rawQuery || '').trim().toLowerCase();
+                    if (!q) {
+                        searchState = { query: '', hits: [], index: -1, token: searchState.token + 1 };
+                        wrappers.forEach(e => applyHighlights(e));
+                        markCurrentHit();
+                        ui.searchCount.textContent = '';
+                        return;
+                    }
+                    let nextIndex;
+                    if (q !== searchState.query) {
+                        const token = searchState.token + 1;
+                        searchState = { query: q, hits: [], index: -1, token };
+                        wrappers.forEach(e => applyHighlights(e));
+                        const hits = [];
+                        for (let p = 0; p < doc.numPages; p++) {
+                            if (destroyed || searchState.token !== token) return;
+                            ui.searchCount.textContent = `Searching ${p + 1}/${doc.numPages}...`;
+                            const page = await doc.getPage(p + 1);
+                            const content = await page.getTextContent();
+                            let k = 0;
+                            content.items.forEach(item => {
+                                if (typeof item.str === 'string' && item.str.toLowerCase().includes(q)) {
+                                    hits.push({ page: p, k });
+                                    k++;
+                                }
+                            });
+                        }
+                        if (destroyed || searchState.token !== token) return;
+                        searchState.hits = hits;
+                        if (hits.length === 0) {
+                            ui.searchCount.textContent = 'No matches';
+                            return;
+                        }
+                        nextIndex = 0;
+                    } else {
+                        const total = searchState.hits.length;
+                        if (total === 0) return;
+                        nextIndex = (searchState.index + (dir < 0 ? -1 : 1) + total) % total;
+                    }
+                    searchState.index = nextIndex;
+                    const hit = searchState.hits[nextIndex];
+                    const entry = wrappers[hit.page];
+                    ui.searchCount.textContent = `${nextIndex + 1} of ${searchState.hits.length}`;
+                    entry.el.scrollIntoView({ block: 'start' });
+                    // The scroll makes the page render; wait for it and its text layer.
+                    await entry.ready;
+                    if (entry.textPromise) await entry.textPromise;
+                    if (destroyed || searchState.index !== nextIndex) return;
+                    applyHighlights(entry);
+                    markCurrentHit();
+                    // The text layer can settle a moment after render; redraw once more.
+                    setTimeout(function () {
+                        if (!destroyed && searchState.index === nextIndex) markCurrentHit();
+                    }, 250);
+                },
+                destroy() {
+                    if (destroyed) return;
+                    destroyed = true;
+                    gen++;
+                    searchState.token++;
+                    try { io.disconnect(); } catch (err) { /* ignore */ }
+                    try { ro.disconnect(); } catch (err) { /* ignore */ }
+                    wrappers.forEach(entry => {
+                        if (entry.task) {
+                            try { entry.task.cancel(); } catch (err) { /* ignore */ }
+                        }
+                    });
+                    scroll.remove();
+                    try { doc.destroy(); } catch (err) { /* ignore */ }
+                }
+            };
+        } catch (err) {
+            destroyed = true;
+            if (scroll) scroll.remove();
+            try { doc.destroy(); } catch (e2) { /* ignore */ }
+            throw err;
+        }
+    }
+    // Saves the already-downloaded PDF under its original file name.
+    function pvDownload(blobUrl, fileName) {
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = /\.pdf$/i.test(fileName || '') ? fileName : `${fileName || 'document'}.pdf`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }
+    // Prints through a tiny off-screen iframe holding the PDF so the browser's
+    // own print dialog handles it. If the browser blocks that, the PDF opens
+    // in a new tab instead (its built-in viewer has a print button).
+    function pvPrint(blobUrl) {
+        const frame = document.createElement('iframe');
+        frame.style.cssText = 'position:fixed;right:0;bottom:0;width:1px;height:1px;opacity:0;border:0;pointer-events:none;';
+        frame.src = blobUrl;
+        frame.onload = function () {
+            // Give the browser's PDF viewer a moment to finish loading.
+            setTimeout(function () {
+                try {
+                    frame.contentWindow.focus();
+                    frame.contentWindow.print();
+                } catch (err) {
+                    console.warn('SDx QoL: in-page print blocked, opening PDF in a new tab', err);
+                    window.open(blobUrl, '_blank', 'noopener');
+                }
+                setTimeout(function () { frame.remove(); }, 120000);
+            }, 600);
+        };
+        document.body.appendChild(frame);
+    }
+    async function pvShowViewer(ui, blobUrl, blob, fileName) {
+        ui.blobUrl = blobUrl;
+        ui.titleEl.textContent = fileName;
+        ui.openBtn.style.display = '';
+        ui.openBtn.onclick = function () {
+            window.open(blobUrl, '_blank', 'noopener');
+        };
+        ui.fitPageBtn.style.display = '';
+        ui.fitWidthBtn.style.display = '';
+        ui.downloadBtn.style.display = '';
+        ui.downloadBtn.onclick = function () { pvDownload(blobUrl, fileName); };
+        ui.printBtn.style.display = '';
+        ui.printBtn.onclick = function () { pvPrint(blobUrl); };
+        const settings = loadViewerSettings();
+        if (settings.engine === 'pdfjs' && pvPdfJsAvailable() && blob) {
+            try {
+                ui.status.textContent = 'Rendering PDF...';
+                const viewer = await pvCreatePdfJsViewer(ui, blob, settings.view);
+                if (pvActiveUi !== ui) {
+                    viewer.destroy(); // viewer was closed/replaced while we were loading
+                    return;
+                }
+                ui.viewer = viewer;
+                ui.status.remove();
+                ui.pageEl.style.display = '';
+                ui.searchWrap.style.display = '';
+                ui.zoomOutBtn.style.display = '';
+                ui.zoomInBtn.style.display = '';
+                pvMarkFitButtons(ui, settings.view);
+                return;
+            } catch (err) {
+                console.warn('SDx QoL: PDF.js viewer failed - falling back to the browser viewer', err);
+            }
+        }
+        if (pvActiveUi !== ui) return;
+        ui.status.remove();
+        pvLoadFrame(ui, settings.view);
+    }
+    async function pvFetchJson(url, token, config, options) {
+        async function attempt(useToken) {
+            const headers = Object.assign({
+                Accept: 'application/json, text/plain, */*',
+                Authorization: `Bearer ${useToken}`
+            }, (options && options.headers) || {});
+            if (config) headers.SPFConfigUID = config;
+            return fetch(url, Object.assign({}, options || {}, { headers }));
+        }
+        let resp = await attempt(token);
+        if (resp.status === 401) {
+            // Token was rejected. Re-read the freshest one we can see and try once more.
+            const fresh = getSdxAuthToken();
+            if (fresh && fresh !== token) {
+                resp = await attempt(fresh);
+            }
+        }
+        if (resp.status === 401) {
+            throw new Error('HTTP 401 - your SDx session may have expired; reload the page and try again');
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        return resp.json();
+    }
+    async function openPdfPreview(obid, name, config) {
+        const ui = buildPreviewModal(name);
+        pvCurrentObid = obid;
+        pvLastObid = obid;
+        pvRefreshActiveHighlight();
+        pvUpdateNav(ui, obid);
+        const myRequest = pvRequestCounter;
+        const stale = () => myRequest !== pvRequestCounter;
+        const fail = msg => {
+            if (stale()) return;
+            ui.status.textContent = msg;
+        };
+        ui.status.textContent = 'Preparing preview...';
+        const token = getSdxAuthToken();
+        if (!token) {
+            fail('Could not read your SDx session token. Try reloading the page.');
+            return;
+        }
+        try {
+            // Step 1: document -> viewable file OBID
+            const compUrl = `${getSdaApiBase()}/Objects('${encodeURIComponent(obid)}')/SPFFileComposition_21?$filter=${encodeURIComponent('SPFViewInd eq true')}&$top=1&$count=true`;
+            const comp = await pvFetchJson(compUrl, token, config, { method: 'GET' });
+            if (stale()) return;
+            const fileItem = comp && Array.isArray(comp.value) ? comp.value[0] : null;
+            if (!fileItem || !fileItem.OBID) {
+                fail('This item has no viewable file to preview.');
+                return;
+            }
+            const fileObid = fileItem.OBID;
+            const fileName = normalizeText(fileItem.Name || fileItem.CI_Name || name);
+            if (!/\.pdf$/i.test(fileName)) {
+                fail(`Preview supports PDF files only (this file is "${fileName}"). Use the filename link to open it normally.`);
+                return;
+            }
+            // Cached from an earlier preview this session: instant.
+            const cached = pvBlobCache.get(fileObid);
+            if (cached) {
+                pvActiveBlobUrl = cached.blobUrl;
+                // Mark as most recently used.
+                pvBlobCache.delete(fileObid);
+                pvBlobCache.set(fileObid, cached);
+                await pvShowViewer(ui, cached.blobUrl, cached.blob, cached.fileName);
+                return;
+            }
+            // Step 2: file OBID -> PDF URI
+            ui.status.textContent = 'Requesting file from SDx...';
+            const uriUrl = `${getSdaApiBase()}/Files('${encodeURIComponent(fileObid)}')/Intergraph.SPF.Server.API.Model.RetrieveFileUris`;
+            const uriData = await pvFetchJson(uriUrl, token, config, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ purposes: ['Markup'], downloadFile: false })
+            });
+            if (stale()) return;
+            const info = uriData && Array.isArray(uriData.value) ? uriData.value[0] : null;
+            if (!info || !info.Uri) {
+                fail('SDx did not return a file location for this item.');
+                return;
+            }
+            // Step 3: fetch the PDF (session cookie, same as the native new-tab
+            // open) and show it from a blob: URL.
+            ui.status.textContent = 'Loading PDF...';
+            let resp = await fetch(info.Uri, { method: 'GET', credentials: 'include' });
+            if (!resp.ok) {
+                resp = await fetch(info.Uri, {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: { Authorization: `Bearer ${token}` }
+                });
+            }
+            if (stale()) return;
+            if (!resp.ok) throw new Error(`HTTP ${resp.status} fetching PDF`);
+            const raw = await resp.blob();
+            if (stale()) return;
+            const pdfBlob = new Blob([raw], { type: 'application/pdf' });
+            const blobUrl = URL.createObjectURL(pdfBlob);
+            // Mark as active BEFORE remembering so a cache limit of 0 can't
+            // evict (and revoke) the PDF we're about to display.
+            pvActiveBlobUrl = blobUrl;
+            pvRememberBlob(fileObid, blobUrl, fileName, raw.size, pdfBlob);
+            await pvShowViewer(ui, blobUrl, pdfBlob, fileName);
+        } catch (err) {
+            console.warn('SDx QoL: PDF preview failed', err);
+            fail(`Preview failed (${err && err.message ? err.message : 'unknown error'}). Use the filename link to open the file normally.`);
+        }
+    }
+    document.addEventListener('click', function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('.' + PV_BTN_CLASS) : null;
+        if (!btn) return;
+        // Keep the click from selecting the row or following the neighbouring link.
+        e.preventDefault();
+        e.stopPropagation();
+        openPdfPreview(btn.dataset.obid, btn.dataset.name, btn.dataset.config || null);
+    }, true);
+    //////////////////////////////////////////////////////////////////////
     // MODULE 4
     // PAGE REFRESH HANDLER
     //////////////////////////////////////////////////////////////////////
@@ -2334,9 +3907,26 @@
         if (lastAppliedPageSize !== null) return;
         const settings = loadSettings();
         const desired = Math.max(1, Number(settings.pageSize) || 100);
-        if (desired === 100) return; // matches SDx's own default - nothing to restore
         const pagerEl = getLikelyMainPager();
         if (!pagerEl) return;
+        // The early DataSource hook (Module 0) may already have created this
+        // list at the right size - in that case there is nothing to re-apply
+        // (and no second load). If it guessed wrong (e.g. the page title
+        // wasn't settled yet), this corrects it, including back to 100.
+        let currentSize = null;
+        try {
+            const gridWidget = findKendoGridFromPager(pagerEl);
+            if (gridWidget && gridWidget.dataSource && typeof gridWidget.dataSource.pageSize === 'function') {
+                currentSize = Number(gridWidget.dataSource.pageSize()) || null;
+            }
+        } catch (err) {
+            currentSize = null;
+        }
+        if (currentSize === desired) {
+            lastAppliedPageSize = desired;
+            return;
+        }
+        if (currentSize === null && desired === 100) return; // can't tell; matches SDx default
         const throwawayStatus = document.createElement('div');
         applySdxPageSize(desired, throwawayStatus);
     }
@@ -2348,6 +3938,10 @@
         applyRowHighlighting();
         maybeSuppressStepDetailsPanel();
         injectDlFilesButton();
+        // Icons are added only after the grid has been quiet for a moment, so
+        // we never inject into intermediate renders that SDx is about to
+        // throw away (and never add DOM churn mid-render).
+        schedulePreviewInjection();
         maybeAutoApplyPageSize();
     }
     function refreshQoL() {
@@ -2373,7 +3967,35 @@
     // common case of "grid just re-rendered" far faster than a 3s poll would.
     setInterval(refreshQoL, 3000);
     const debouncedRefresh = debounce(refreshQoL, 150);
-    const gridChangeObserver = new MutationObserver(function () {
+    // True if any mutation added table/grid row content (as opposed to, say,
+    // a tooltip or our own button being inserted).
+    function mutationsAddedGridRows(records) {
+        for (const record of records) {
+            for (const node of record.addedNodes) {
+                if (node.nodeType !== 1) continue;
+                const tag = node.tagName;
+                if (tag === 'TR' || tag === 'TD' || tag === 'TBODY' || tag === 'TABLE') return true;
+                if (node.querySelector && node.querySelector('tr')) return true;
+            }
+        }
+        return false;
+    }
+    const gridChangeObserver = new MutationObserver(function (records) {
+        // Hide configured columns IMMEDIATELY. MutationObserver callbacks run
+        // before the browser paints, so freshly rendered rows never appear
+        // with their hidden columns visible. This only toggles classes
+        // (attribute changes), which this childList-only observer ignores,
+        // so it cannot loop.
+        if (mutationsAddedGridRows(records)) {
+            try { applyHiddenColumns(); } catch (err) { /* fall through to debounced pass */ }
+            // Preview icons go in right away too, so they appear with the
+            // rows instead of trailing in afterwards. (The earlier 500ms
+            // delay was meant to dodge mid-render churn, but that churn was
+            // really the page-size double-load, which the early hook fixed.)
+            // Rows that aren't data-bound yet are skipped and retried below.
+            try { injectPreviewButtons(); } catch (err) { /* debounced pass will retry */ }
+        }
+        // Everything else (tooltips, highlighting, buttons, page size) stays debounced.
         debouncedRefresh();
     });
     function startGridChangeObserver() {
@@ -2384,8 +4006,4 @@
         gridChangeObserver.observe(document.body, { childList: true, subtree: true });
     }
     startGridChangeObserver();
-    //////////////////////////////////////////////////////////////////////
-    // MODULE 5
-    // FUTURE QUALITY-OF-LIFE ENHANCEMENTS
-    //////////////////////////////////////////////////////////////////////
 })();
