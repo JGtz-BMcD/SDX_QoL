@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.5
-// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, session-expiry indicator, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), and in-page PDF preview with next/previous, search, zoom, fit, print and download.
+// @version      1.8
+// @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), in-page PDF preview with next/previous, search, zoom, fit, print and download, work package indexing that turns document numbers on sheets into clickable links, and a typed smart filter for any list.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
 // @require      https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js
@@ -34,7 +34,7 @@
     };
     const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
     const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
-    console.log(`${SCRIPT_NAME} loaded`);
+    console.log(`${SCRIPT_NAME} v1.8 loaded`);
     //////////////////////////////////////////////////////////////////////
     // MODULE 0
     // EARLY KENDO DATASOURCE HOOK (page size)
@@ -126,6 +126,17 @@
         } catch (err) { /* ignore */ }
         return null;
     }
+    // Remembers the last few OData list reads (URL + headers) SDx itself made, so the smart filter can ask
+    // the server for the matching total and keep the pager's "of N items" correct.
+    const recentReads = [];
+    function noteRead(url, headers) {
+        try {
+            const u = String(url || '');
+            if (!/[?&](?:\$|%24)top=/i.test(u) || !/\/api\/v2\//i.test(u)) return;
+            recentReads.push({ url: u, headers: headers || {}, t: Date.now() });
+            if (recentReads.length > 20) recentReads.shift();
+        } catch (err) { /* ignore */ }
+    }
     (function installAuthTokenWatcher() {
         if (!isTopFrame()) return;
         try {
@@ -138,13 +149,36 @@
                             (input && typeof input === 'object' ? readHeaderCaseInsensitive(input.headers, 'authorization') : null);
                         if (value) rememberAuthToken(value);
                     } catch (err) { /* never break the page's own request */ }
+                    try {
+                        const url = typeof input === 'string' ? input : (input && input.url);
+                        const method = String((init && init.method) || (input && input.method) || 'GET').toUpperCase();
+                        const hdrs = {};
+                        const src = (init && init.headers) || (input && typeof input === 'object' ? input.headers : null);
+                        if (src && typeof src.forEach === 'function') src.forEach((v, k) => { hdrs[k] = v; });
+                        else if (src && typeof src === 'object') Object.keys(src).forEach(k => { hdrs[k] = src[k]; });
+                        if (method === 'GET') noteRead(url, hdrs);
+                    } catch (err) { /* ignore */ }
                     return originalFetch.apply(this, arguments);
                 };
             }
+            const originalOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                try { this.__sdxQolReq = { method: String(method).toUpperCase(), url: String(url), headers: {} }; } catch (err) { /* ignore */ }
+                return originalOpen.apply(this, arguments);
+            };
+            const originalSend = XMLHttpRequest.prototype.send;
+            XMLHttpRequest.prototype.send = function () {
+                try {
+                    const r = this.__sdxQolReq;
+                    if (r && r.method === 'GET') noteRead(r.url, r.headers);
+                } catch (err) { /* ignore */ }
+                return originalSend.apply(this, arguments);
+            };
             const originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
             XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
                 try {
                     if (String(name).toLowerCase() === 'authorization') rememberAuthToken(value);
+                    if (this.__sdxQolReq) this.__sdxQolReq.headers[name] = value;
                 } catch (err) { /* never break the page's own request */ }
                 return originalSetRequestHeader.apply(this, arguments);
             };
@@ -1088,6 +1122,52 @@
         const style = document.createElement('style');
         style.id = MANAGER.styleId;
         style.textContent = `
+            #${SF_WRAP_ID} {
+                display: inline-flex !important;
+                align-items: center !important;
+                gap: 4px !important;
+                margin-right: 10px !important;
+                vertical-align: middle !important;
+            }
+            #${SF_WRAP_ID} input {
+                height: 32px !important;
+                width: 300px !important;
+                box-sizing: border-box !important;
+                padding: 0 12px !important;
+                border: 2px solid #0078d4 !important;
+                border-radius: 6px !important;
+                font: 13px Arial, sans-serif !important;
+                background: #eaf4fd !important;
+                color: #003a6c !important;
+                box-shadow: 0 0 0 3px rgba(0,120,212,0.20), 0 1px 3px rgba(0,0,0,0.20) !important;
+            }
+            #${SF_WRAP_ID} input::placeholder { color: #3a7fb8 !important; opacity: 1 !important; }
+            #${SF_WRAP_ID} input:focus { background: #ffffff !important; outline: none !important; box-shadow: 0 0 0 4px rgba(0,120,212,0.40), 0 1px 3px rgba(0,0,0,0.25) !important; }
+            #${SF_WRAP_ID} .sdx-qol-sf-badge {
+                height: 24px; padding: 0 8px; border: 0; border-radius: 12px;
+                background: #0078d4; color: #fff; font: 600 12px Arial, sans-serif; cursor: pointer;
+            }
+            #${SF_WRAP_ID} .sdx-qol-sf-clear {
+                height: 32px; padding: 0 12px; border: 1px solid #a4262c; border-radius: 6px; background: #d13438;
+                color: #ffffff; font: 600 12px Arial, sans-serif; cursor: pointer;
+            }
+            #${SF_WRAP_ID} .sdx-qol-sf-clear:hover { background: #a4262c; }
+            #${SF_WRAP_ID} .sdx-qol-sf-apply {
+                height: 32px; padding: 0 14px; border: 1px solid #005a9e; border-radius: 6px; background: #0078d4;
+                color: #ffffff; font: 600 12px Arial, sans-serif; cursor: pointer;
+            }
+            #${SF_WRAP_ID} .sdx-qol-sf-apply:hover { background: #106ebe; }
+            #${SF_PANEL_ID} {
+                position: fixed; z-index: 2147483000; width: 440px; max-width: calc(100vw - 16px);
+                background: #fff; color: #201f1e; border: 1px solid #c8c6c4; border-radius: 6px;
+                box-shadow: 0 6px 20px rgba(0,0,0,0.25); padding: 10px; font: 13px Arial, sans-serif;
+            }
+            #${SF_PANEL_ID} .sdx-qol-sf-title { font-weight: 600; margin-bottom: 8px; }
+            #${SF_PANEL_ID} .sdx-qol-sf-chip { display: flex; align-items: center; gap: 6px; padding: 4px 0; border-top: 1px solid #edebe9; }
+            #${SF_PANEL_ID} .sdx-qol-sf-chip-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+            #${SF_PANEL_ID} select { max-width: 130px; height: 26px; font: 12px Arial, sans-serif; }
+            #${SF_PANEL_ID} button { cursor: pointer; border: 1px solid #c8c6c4; background: #f3f2f1; border-radius: 4px; padding: 2px 8px; }
+            #${SF_PANEL_ID} .sdx-qol-sf-foot { margin-top: 8px; text-align: right; }
             #${MANAGER.buttonId} {
                 margin-left: 8px !important;
                 padding: 5px 12px !important;
@@ -1253,23 +1333,6 @@
             .sdx-qol-row-high-completion > [role="gridcell"],
             .sdx-qol-row-high-completion > [role="cell"] {
                 background-color: #e6f4ea !important;
-            }
-            #${SESSION_BUTTON_ID}.sdx-qol-session-expired svg {
-                fill: #d13438 !important;
-            }
-            #${SESSION_BUTTON_ID}.sdx-qol-session-expired {
-                position: relative !important;
-            }
-            #${SESSION_BUTTON_ID}.sdx-qol-session-expired::after {
-                content: '' !important;
-                position: absolute !important;
-                top: 6px !important;
-                right: 6px !important;
-                width: 8px !important;
-                height: 8px !important;
-                border-radius: 50% !important;
-                background: #d13438 !important;
-                box-shadow: 0 0 0 2px #ffffff !important;
             }
             #${DL_BUTTON_ID} {
                 margin-left: 8px !important;
@@ -1456,6 +1519,74 @@
                 margin: 0 auto 12px auto !important;
                 background: #ffffff !important;
                 box-shadow: 0 1px 6px rgba(0,0,0,0.5) !important;
+            }
+            #${WP_BTN_ID} {
+                margin-left: 8px !important;
+                padding: 5px 12px !important;
+                border: 1px solid #0b5cad !important;
+                border-radius: 4px !important;
+                background: #1a73e8 !important;
+                color: #ffffff !important;
+                font: 13px Arial, sans-serif !important;
+                font-weight: 600 !important;
+                cursor: pointer !important;
+                height: 30px !important;
+                line-height: 18px !important;
+                display: inline-flex !important;
+                align-items: center !important;
+                gap: 5px !important;
+                vertical-align: middle !important;
+                box-shadow: 0 1px 3px rgba(0,0,0,0.25) !important;
+            }
+            #${WP_BTN_ID}:hover:not(:disabled) {
+                background: #0b5cad !important;
+            }
+            #${WP_BTN_ID}:disabled {
+                opacity: 0.7 !important;
+                cursor: progress !important;
+            }
+            .sdx-qol-pv-links {
+                position: absolute !important;
+                inset: 0 !important;
+                pointer-events: none !important;
+                overflow: hidden !important;
+            }
+            .sdx-qol-pv-link {
+                position: absolute !important;
+                pointer-events: auto !important;
+                cursor: pointer !important;
+                box-sizing: border-box !important;
+                background: rgba(0, 190, 210, 0.15) !important;
+                border: 1px solid rgba(0, 160, 185, 0.9) !important;
+                border-radius: 2px !important;
+            }
+            .sdx-qol-pv-link:hover {
+                background: rgba(0, 190, 210, 0.38) !important;
+            }
+            .sdx-qol-pv-link-range {
+                border-style: dashed !important;
+            }
+            .sdx-qol-pv-rangemenu {
+                position: fixed !important;
+                z-index: 1000001 !important;
+                min-width: 260px !important;
+                max-width: 480px !important;
+                max-height: 320px !important;
+                overflow: auto !important;
+                background: #ffffff !important;
+                color: #222222 !important;
+                border: 1px solid #999999 !important;
+                border-radius: 4px !important;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.35) !important;
+                font: 12px Arial, sans-serif !important;
+            }
+            .sdx-qol-pv-rangemenu-item {
+                padding: 5px 10px !important;
+                cursor: pointer !important;
+                border-bottom: 1px solid #eeeeee !important;
+            }
+            .sdx-qol-pv-rangemenu-item:hover {
+                background: #dbe8fa !important;
             }
             .sdx-qol-pv-search {
                 flex: 0 0 auto !important;
@@ -1901,7 +2032,7 @@
         control.appendChild(caution);
         menu.appendChild(control);
     }
-    function formatBytes(bytes) {
+    function formatCacheSize(bytes) {
         if (!bytes) return '0 MB';
         const mb = bytes / (1024 * 1024);
         return mb < 0.1 ? '<0.1 MB' : `${mb.toFixed(1)} MB`;
@@ -1959,6 +2090,62 @@
         viewSection.appendChild(viewLabel);
         viewSection.appendChild(viewNote);
         menu.appendChild(viewSection);
+        // --- Document-number links + work package indexes ---
+        const linksSection = document.createElement('div');
+        linksSection.className = 'sdx-section';
+        const linksLabel = document.createElement('label');
+        linksLabel.className = 'sdx-item';
+        const linksCb = document.createElement('input');
+        linksCb.type = 'checkbox';
+        linksCb.checked = settings.docLinks;
+        const linksSpan = document.createElement('span');
+        linksSpan.textContent = 'Link document numbers to other sheets in the same indexed work package';
+        linksCb.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.docLinks = linksCb.checked;
+            saveViewerSettings(s);
+        });
+        linksLabel.appendChild(linksCb);
+        linksLabel.appendChild(linksSpan);
+        linksSection.appendChild(linksLabel);
+        const linksNote = document.createElement('div');
+        linksNote.className = 'sdx-note';
+        linksNote.textContent = 'Enhanced viewer only. Open a work package\'s documents list and click "WP Index" to index it; applies the next time a sheet is opened.';
+        linksSection.appendChild(linksNote);
+        const wpIndex = loadWpIndex();
+        const wpNames = Object.keys(wpIndex).sort();
+        const wpList = document.createElement('div');
+        wpList.style.marginTop = '6px';
+        if (!wpNames.length) {
+            const none = document.createElement('div');
+            none.className = 'sdx-note';
+            none.textContent = 'No work packages indexed yet.';
+            wpList.appendChild(none);
+        } else {
+            wpNames.forEach(name => {
+                const snap = wpIndex[name];
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:6px;margin:2px 0;font-size:12px;';
+                const text = document.createElement('span');
+                text.style.flex = '1 1 auto';
+                text.textContent = `${name} - ${(snap.docs || []).length} docs, ${new Date(snap.savedAt || 0).toLocaleDateString()}`;
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.textContent = 'Remove';
+                remove.addEventListener('click', function () {
+                    const current = loadWpIndex();
+                    delete current[name];
+                    saveWpIndex(current);
+                    row.remove();
+                    injectWpIndexButton();
+                });
+                row.appendChild(text);
+                row.appendChild(remove);
+                wpList.appendChild(row);
+            });
+        }
+        linksSection.appendChild(wpList);
+        menu.appendChild(linksSection);
         // --- Viewer engine ---
         const engineSection = document.createElement('div');
         engineSection.className = 'sdx-section';
@@ -2007,7 +2194,7 @@
         stats.className = 'sdx-note';
         function updateStats() {
             const st = pvGetCacheStats();
-            stats.textContent = `Currently cached: ${st.count} PDF${st.count === 1 ? '' : 's'} (${formatBytes(st.bytes)})`;
+            stats.textContent = `Currently cached: ${st.count} PDF${st.count === 1 ? '' : 's'} (${formatCacheSize(st.bytes)})`;
         }
         updateStats();
         slider.addEventListener('input', updateCacheLabel);
@@ -2193,91 +2380,6 @@
     }
     //////////////////////////////////////////////////////////////////////
     // MODULE 3G
-    // SESSION STATUS INDICATOR (sidebar)
-    //////////////////////////////////////////////////////////////////////
-    // We don't have visibility into how SDx tracks its own token/session
-    // expiry internally, so rather than guess with an idle timer (which could
-    // easily be wrong about the real timeout window), this watches actual
-    // network responses for the status codes apps commonly use to signal an
-    // expired session (401 Unauthorized, 419/440 session-timeout variants)
-    // and flips the sidebar icon the moment one is seen - the same signal
-    // SDx's own code would be reacting to, just surfaced to you directly.
-    const SESSION_BUTTON_ID = 'sdx-qol-session-status-btn';
-    const SESSION_EXPIRED_STATUSES = new Set([401, 419, 440]);
-    let sessionExpiredDetected = false;
-    function markSessionExpired() {
-        if (sessionExpiredDetected) return;
-        sessionExpiredDetected = true;
-        const btn = document.getElementById(SESSION_BUTTON_ID);
-        if (btn) {
-            btn.classList.add('sdx-qol-session-expired');
-            btn.title = 'SDx session appears to have expired - save your work and refresh';
-        }
-        console.warn('SDx QoL: a request came back with an auth-expired status. Session may have timed out.');
-    }
-    function installSessionWatcher() {
-        const originalFetch = window.fetch;
-        if (originalFetch && !originalFetch.__sdxQolWrapped) {
-            const wrappedFetch = function (...args) {
-                return originalFetch.apply(this, args).then(function (response) {
-                    if (response && SESSION_EXPIRED_STATUSES.has(response.status)) {
-                        markSessionExpired();
-                    }
-                    return response;
-                });
-            };
-            wrappedFetch.__sdxQolWrapped = true;
-            window.fetch = wrappedFetch;
-        }
-        const originalOpen = XMLHttpRequest.prototype.open;
-        if (!originalOpen.__sdxQolWrapped) {
-            const wrappedOpen = function (...args) {
-                this.addEventListener('load', function () {
-                    if (SESSION_EXPIRED_STATUSES.has(this.status)) {
-                        markSessionExpired();
-                    }
-                });
-                return originalOpen.apply(this, args);
-            };
-            wrappedOpen.__sdxQolWrapped = true;
-            XMLHttpRequest.prototype.open = wrappedOpen;
-        }
-    }
-    function injectSessionButton() {
-        if (document.getElementById(SESSION_BUTTON_ID)) return;
-        const nav = document.querySelector('nav.side-bar');
-        if (!nav) return;
-        const groups = nav.querySelectorAll('.side-bar__group');
-        const targetGroup = groups.length ? groups[groups.length - 1] : nav;
-        const button = document.createElement('button');
-        button.id = SESSION_BUTTON_ID;
-        button.type = 'button';
-        button.className = 'side-bar__button';
-        button.title = 'Session status: OK';
-        button.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="100%" height="100%" focusable="false">'
-            + '<path d="M12,2A10,10,0,1,0,22,12,10,10,0,0,0,12,2Zm0,18a8,8,0,1,1,8-8A8,8,0,0,1,12,20Z"></path>'
-            + '<path d="M12.5,7H11V13l5.25,3.15.75-1.23-4.5-2.67Z"></path>'
-            + '</svg>';
-        button.addEventListener('click', function (e) {
-            e.preventDefault();
-            e.stopPropagation();
-            if (sessionExpiredDetected) {
-                if (confirm('Your SDx session may have expired. Reload the page now?')) {
-                    location.reload();
-                }
-            } else {
-                alert('No session issues detected yet. This icon turns red automatically if a request comes back as expired.');
-            }
-        });
-        if (sessionExpiredDetected) {
-            button.classList.add('sdx-qol-session-expired');
-            button.title = 'SDx session appears to have expired - save your work and refresh';
-        }
-        targetGroup.appendChild(button);
-    }
-    installSessionWatcher();
-    //////////////////////////////////////////////////////////////////////
-    // MODULE 3H
     // BULK FILE DOWNLOAD ("DL Files")
     //////////////////////////////////////////////////////////////////////
     // SDx's own download flow (checkbox-select rows -> Actions > Files >
@@ -2895,7 +2997,7 @@
         setTimeout(injectDlFilesButton, 0);
     }, true);
     //////////////////////////////////////////////////////////////////////
-    // MODULE 3K
+    // MODULE 3H
     // PDF PREVIEW (small icon beside each document name)
     //////////////////////////////////////////////////////////////////////
     // Flow confirmed via live network capture of SDx's own "open file" click:
@@ -2920,7 +3022,7 @@
     // Edge; fit page/width always honored), 'native' = the browser's built-in
     // PDF viewer in an iframe (Edge's ignores the fit setting).
     function getDefaultViewerSettings() {
-        return { enabled: true, view: 'Fit', cacheMax: 5, engine: 'pdfjs' };
+        return { enabled: true, view: 'Fit', cacheMax: 5, engine: 'pdfjs', docLinks: true };
     }
     function loadViewerSettings() {
         const defaults = getDefaultViewerSettings();
@@ -2933,7 +3035,8 @@
                 enabled: typeof parsed.enabled === 'boolean' ? parsed.enabled : defaults.enabled,
                 view: parsed.view === 'FitH' ? 'FitH' : 'Fit',
                 cacheMax: Number.isFinite(cacheMax) ? Math.min(100, Math.max(0, Math.round(cacheMax))) : defaults.cacheMax,
-                engine: parsed.engine === 'native' ? 'native' : 'pdfjs'
+                engine: parsed.engine === 'native' ? 'native' : 'pdfjs',
+                docLinks: typeof parsed.docLinks === 'boolean' ? parsed.docLinks : defaults.docLinks
             };
         } catch (err) {
             return defaults;
@@ -2945,7 +3048,8 @@
                 enabled: Boolean(settings.enabled),
                 view: settings.view === 'FitH' ? 'FitH' : 'Fit',
                 cacheMax: Math.min(100, Math.max(0, Math.round(Number(settings.cacheMax) || 0))),
-                engine: settings.engine === 'native' ? 'native' : 'pdfjs'
+                engine: settings.engine === 'native' ? 'native' : 'pdfjs',
+                docLinks: settings.docLinks !== false
             }));
         } catch (err) {
             console.warn('SDx QoL: could not save viewer settings', err);
@@ -2954,6 +3058,8 @@
     const pvBlobCache = new Map(); // fileObid -> { blobUrl, fileName, size }
     let pvRequestCounter = 0;
     let pvCurrentObid = null;
+    let pvCurrentMeta = null; // { obid, name, config } of the document on screen
+    const pvHistory = []; // documents we followed a link away from (for Back)
     let pvLastObid = null; // last document opened - stays highlighted after the viewer closes
     let pvActiveUi = null; // UI handles of the currently open viewer
     let pvEscHandler = null;
@@ -3015,7 +3121,13 @@
         if (pvLastObid !== null) pvRefreshActiveHighlight();
     }
     const schedulePreviewInjection = debounce(injectPreviewButtons, 100);
+    // Closing the viewer for good also forgets the "Back" trail from
+    // link-to-link navigation.
     function closePreviewModal() {
+        pvHistory.length = 0;
+        pvTeardownModal();
+    }
+    function pvTeardownModal() {
         pvRequestCounter++; // invalidates any in-flight request
         const existing = document.getElementById(PV_MODAL_ID);
         if (existing) existing.remove();
@@ -3090,7 +3202,8 @@
         }
     }
     function buildPreviewModal(title) {
-        closePreviewModal();
+        // Tear down the previous viewer WITHOUT clearing the Back trail.
+        pvTeardownModal();
         const modal = document.createElement('div');
         modal.id = PV_MODAL_ID;
         const backdrop = document.createElement('div');
@@ -3100,6 +3213,15 @@
         panel.className = 'sdx-qol-pv-panel';
         const header = document.createElement('div');
         header.className = 'sdx-qol-pv-header';
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.textContent = '← Back';
+        backBtn.title = 'Return to the sheet you followed a link from';
+        backBtn.style.display = 'none';
+        backBtn.addEventListener('click', function () {
+            const previous = pvHistory.pop();
+            if (previous) openPdfPreview(previous.obid, previous.name, previous.config);
+        });
         const titleEl = document.createElement('div');
         titleEl.className = 'sdx-qol-pv-title';
         titleEl.textContent = title;
@@ -3182,6 +3304,7 @@
         closeBtn.type = 'button';
         closeBtn.textContent = 'Close';
         closeBtn.addEventListener('click', closePreviewModal);
+        header.appendChild(backBtn);
         header.appendChild(titleEl);
         header.appendChild(counterEl);
         header.appendChild(pageEl);
@@ -3239,7 +3362,7 @@
             }
         };
         document.addEventListener('keydown', pvEscHandler, true);
-        const ui = { titleEl, counterEl, openBtn, body, status, prevBtn, nextBtn, fitPageBtn, fitWidthBtn, pageEl, zoomOutBtn, zoomInBtn, searchWrap, searchInput, searchCount, downloadBtn, printBtn, blobUrl: null, frame: null, viewer: null };
+        const ui = { titleEl, counterEl, openBtn, body, status, prevBtn, nextBtn, fitPageBtn, fitWidthBtn, pageEl, zoomOutBtn, zoomInBtn, searchWrap, searchInput, searchCount, downloadBtn, printBtn, backBtn, blobUrl: null, frame: null, viewer: null, linkCtx: null };
         pvActiveUi = ui;
         return ui;
     }
@@ -3531,7 +3654,14 @@
                         entry.textTask = textTask;
                         entry.textPromise = textTask.promise
                             .then(() => {
-                                if (!destroyed && myGen === gen) applyHighlights(entry);
+                                if (destroyed || myGen !== gen) return;
+                                applyHighlights(entry);
+                                // Clickable links to other sheets in the same indexed work package.
+                                if (ui.linkCtx) {
+                                    try { pvDrawDocLinks(entry, ui.linkCtx); } catch (linkErr) {
+                                        console.warn('SDx QoL: document link overlay failed', linkErr);
+                                    }
+                                }
                             })
                             .catch(() => {});
                     } catch (textErr) {
@@ -3804,7 +3934,11 @@
     async function openPdfPreview(obid, name, config) {
         const ui = buildPreviewModal(name);
         pvCurrentObid = obid;
+        pvCurrentMeta = { obid, name, config };
         pvLastObid = obid;
+        ui.backBtn.style.display = pvHistory.length ? '' : 'none';
+        // Document-number links (only for documents in an indexed work package).
+        ui.linkCtx = pvGetLinkContext(obid, name);
         pvRefreshActiveHighlight();
         pvUpdateNav(ui, obid);
         const myRequest = pvRequestCounter;
@@ -3895,6 +4029,1177 @@
         openPdfPreview(btn.dataset.obid, btn.dataset.name, btn.dataset.config || null);
     }, true);
     //////////////////////////////////////////////////////////////////////
+    // MODULE 3I
+    // WORK PACKAGE INDEX + DOCUMENT-NUMBER LINKS (sheet to sheet)
+    //////////////////////////////////////////////////////////////////////
+    // A work package's documents list is recognisable from the page URL
+    // (entityType BMcD_SubContractor_Docs filtered by field WP). "WP Index"
+    // saves a snapshot of that package's document numbers (one request; the
+    // PDFs themselves are not opened). While viewing a sheet that belongs to a
+    // snapshot in the Enhanced viewer, any COMPLETE document number found in
+    // the sheet's text that is also in the same snapshot becomes a clickable
+    // link. Only whole numbers are matched (short forms like "SP-300-01"
+    // are NOT used - they matched the wrong sheet in testing), with an
+    // optional "-NN" sheet suffix after the number, and "A THROUGH B" ranges.
+    const WP_BTN_ID = 'sdx-qol-wp-index-btn';
+    const WP_INDEX_KEY = `${STORAGE_PREFIX}:wpIndex`;
+    let wpIndexBusy = false;
+    let wpLookupCache = null; // { byId: Map, byName: Map }
+    const wpLinkCtxCache = new Map(); // wpName -> context
+    // Returns { wp, config, entityType } when the current page is a work
+    // package's documents list, else null.
+    function getWorkPackageContext() {
+        try {
+            const match = /queryFilter=([^;]+)/.exec(location.hash || '');
+            if (!match) return null;
+            const qf = JSON.parse(decodeURIComponent(match[1]));
+            if (!qf || !qf.entityType) return null; // any list filtered on a WP field is treated as a work package's documents
+            let wp = null;
+            (function walk(node) {
+                if (!node || wp) return;
+                if (Array.isArray(node)) { node.forEach(walk); return; }
+                if (typeof node !== 'object') return;
+                if (node.field === 'WP' && node.operator === 'eq' && typeof node.value === 'string') {
+                    wp = node.value;
+                    return;
+                }
+                Object.values(node).forEach(walk);
+            })(qf.filters);
+            if (!wp) return null;
+            return { wp, config: qf.config && qf.config.key ? qf.config.key : null, entityType: qf.entityType };
+        } catch (err) {
+            return null;
+        }
+    }
+    function loadWpIndex() {
+        try {
+            return JSON.parse(localStorage.getItem(WP_INDEX_KEY)) || {};
+        } catch (err) {
+            return {};
+        }
+    }
+    function saveWpIndex(index) {
+        wpLookupCache = null;
+        wpLinkCtxCache.clear();
+        try {
+            localStorage.setItem(WP_INDEX_KEY, JSON.stringify(index));
+            return true;
+        } catch (err) {
+            console.warn('SDx QoL: could not save work package index', err);
+            return false;
+        }
+    }
+    function wpNameKey(name) {
+        return String(name || '').replace(/^\d+_/, '').trim().toUpperCase();
+    }
+    function getWpLookup() {
+        if (wpLookupCache) return wpLookupCache;
+        const byId = new Map();
+        const byName = new Map();
+        const index = loadWpIndex();
+        Object.keys(index).forEach(wp => {
+            (index[wp].docs || []).forEach(d => {
+                if (d.i && !byId.has(d.i)) byId.set(d.i, wp);
+                [d.n, d.a].forEach(nm => {
+                    const key = wpNameKey(nm);
+                    if (key && !byName.has(key)) byName.set(key, wp);
+                });
+            });
+        });
+        wpLookupCache = { byId, byName };
+        return wpLookupCache;
+    }
+    // "PRS-R00-SB-213" -> { prefix: "PRS-R00-SB", num: 213 }; ignores a
+    // trailing 2-digit sheet suffix such as "-01". null if there's no number.
+    function parseDocNumber(term) {
+        const segs = String(term || '').split(/[-_. ]+/).filter(Boolean);
+        let k = segs.length - 1;
+        if (k >= 1 && /^\d+$/.test(segs[k]) && /^\d+$/.test(segs[k - 1])) k--;
+        if (k < 0 || !/^\d+$/.test(segs[k])) return null;
+        return { prefix: segs.slice(0, k).join('-').toUpperCase(), num: parseInt(segs[k], 10) };
+    }
+    // Builds (and caches) the matcher set for one work package.
+    function buildWpLinkContext(wpName) {
+        if (wpLinkCtxCache.has(wpName)) return wpLinkCtxCache.get(wpName);
+        const snap = loadWpIndex()[wpName];
+        if (!snap) return null;
+        const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const matchers = [];
+        const docs = [];
+        const seenTerms = new Set();
+        (snap.docs || []).forEach(d => {
+            if (!d.i) return; // no id = nothing to open
+            docs.push(d);
+            const terms = new Set();
+            [d.a, d.n].forEach(raw => {
+                const t = String(raw || '').replace(/^\d+_/, '').trim();
+                if (t.length >= 6) terms.add(t);
+            });
+            terms.forEach(term => {
+                const key = term.toUpperCase();
+                if (seenTerms.has(key)) return;
+                seenTerms.add(key);
+                const segs = term.split(/[-_. ]+/).filter(Boolean);
+                if (segs.length < 2) return;
+                matchers.push({
+                    doc: d,
+                    term,
+                    lastSeg: segs[segs.length - 1].toUpperCase(),
+                    parsed: parseDocNumber(term),
+                    re: new RegExp('(?<![A-Z0-9])' + segs.map(esc).join('[-_. ]?') + '(?:[-_. ]\\d{2})?(?![A-Z0-9])', 'gi')
+                });
+            });
+        });
+        const ctx = { wp: wpName, config: snap.config || null, docs, matchers };
+        wpLinkCtxCache.set(wpName, ctx);
+        return ctx;
+    }
+    // Link context for the document being viewed, or null when it isn't in an
+    // indexed work package (or links are switched off).
+    function pvGetLinkContext(docId, docName) {
+        try {
+            if (!loadViewerSettings().docLinks) return null;
+            const lookup = getWpLookup();
+            const wp = (docId && lookup.byId.get(docId)) || lookup.byName.get(wpNameKey(docName));
+            if (!wp) return null;
+            const ctx = buildWpLinkContext(wp);
+            return ctx && ctx.matchers.length ? { ctx, selfId: docId, selfName: wpNameKey(docName) } : null;
+        } catch (err) {
+            console.warn('SDx QoL: link context failed', err);
+            return null;
+        }
+    }
+    // Finds document numbers in one page's text. Returns [{start,end,doc}]
+    // plus [{start,end,docs}] for "A THROUGH B" ranges.
+    function pvFindDocMatches(text, linkCtx) {
+        const { ctx, selfId, selfName } = linkCtx;
+        const upper = text.toUpperCase();
+        const raw = [];
+        ctx.matchers.forEach(m => {
+            if (m.doc.i === selfId) return;
+            if (selfName && (wpNameKey(m.doc.n) === selfName || wpNameKey(m.doc.a) === selfName)) return;
+            if (!upper.includes(m.lastSeg)) return; // cheap pre-check
+            m.re.lastIndex = 0;
+            let hit;
+            while ((hit = m.re.exec(text)) !== null) {
+                raw.push({ start: hit.index, end: hit.index + hit[0].length, doc: m.doc, parsed: m.parsed });
+                if (hit[0].length === 0) m.re.lastIndex++;
+            }
+        });
+        // Earliest first; for the same start prefer the longest. Drop overlaps.
+        raw.sort((a, b) => a.start - b.start || (b.end - b.start) - (a.end - a.start));
+        const matches = [];
+        let lastEnd = -1;
+        raw.forEach(m => {
+            if (m.start >= lastEnd) {
+                matches.push(m);
+                lastEnd = m.end;
+            }
+        });
+        // "PRS-COM-SB-001-01 THROUGH PRS-COM-SB-016-01"
+        const ranges = [];
+        for (let i = 0; i + 1 < matches.length; i++) {
+            const a = matches[i];
+            const b = matches[i + 1];
+            if (!a.parsed || !b.parsed || a.parsed.prefix !== b.parsed.prefix) continue;
+            if (!/^\s*(?:THROUGH|THRU|TO)\s*$/i.test(text.slice(a.end, b.start))) continue;
+            const lo = Math.min(a.parsed.num, b.parsed.num);
+            const hi = Math.max(a.parsed.num, b.parsed.num);
+            const members = [];
+            ctx.matchers.forEach(m => {
+                if (m.parsed && m.parsed.prefix === a.parsed.prefix && m.parsed.num >= lo && m.parsed.num <= hi) {
+                    if (!members.some(x => x.i === m.doc.i)) members.push(m.doc);
+                }
+            });
+            members.sort((x, y) => (parseDocNumber(x.a || x.n).num || 0) - (parseDocNumber(y.a || y.n).num || 0));
+            if (members.length > 2) ranges.push({ start: a.end, end: b.start, docs: members });
+        }
+        return { matches, ranges };
+    }
+    // Draws clickable boxes over every found document number on one rendered
+    // PDF.js page. Positions come from measuring the real text-layer glyphs.
+    function pvDrawDocLinks(entry, linkCtx) {
+        const oldLayer = entry.el.querySelector('.sdx-qol-pv-links');
+        if (oldLayer) oldLayer.remove();
+        if (!entry.textStrs.length) return;
+        // Concatenate the page text, remembering which text-layer element each part came from.
+        let text = '';
+        const parts = [];
+        entry.textStrs.forEach((s, i) => {
+            if (i > 0) text += ' ';
+            const start = text.length;
+            text += String(s);
+            parts.push({ start, end: text.length, div: entry.textDivs[i] });
+        });
+        const found = pvFindDocMatches(text, linkCtx);
+        if (!found.matches.length && !found.ranges.length) return;
+        const layer = document.createElement('div');
+        layer.className = 'sdx-qol-pv-links';
+        entry.el.appendChild(layer);
+        const wrapRect = entry.el.getBoundingClientRect();
+        function addBoxes(start, end, onClick, tip, extraClass) {
+            parts.forEach(part => {
+                if (part.end <= start || part.start >= end || !part.div) return;
+                const node = part.div.firstChild;
+                if (!node || node.nodeType !== 3) return;
+                const from = Math.max(start, part.start) - part.start;
+                const to = Math.min(end, part.end) - part.start;
+                if (to <= from) return;
+                try {
+                    const range = document.createRange();
+                    range.setStart(node, from);
+                    range.setEnd(node, Math.min(node.nodeValue.length, to));
+                    for (const r of range.getClientRects()) {
+                        if (r.width <= 0 || r.height <= 0) continue;
+                        const box = document.createElement('div');
+                        box.className = 'sdx-qol-pv-link' + (extraClass ? ' ' + extraClass : '');
+                        box.style.left = `${r.left - wrapRect.left}px`;
+                        box.style.top = `${r.top - wrapRect.top}px`;
+                        box.style.width = `${r.width}px`;
+                        box.style.height = `${r.height}px`;
+                        box.title = tip;
+                        box.addEventListener('click', function (e) {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            onClick(e);
+                        });
+                        layer.appendChild(box);
+                    }
+                } catch (err) { /* ignore a bad range */ }
+            });
+        }
+        found.matches.forEach(m => {
+            const label = m.doc.a || m.doc.n;
+            addBoxes(m.start, m.end, function () {
+                pvFollowDocLink(m.doc, linkCtx.ctx.config);
+            }, `Open ${label}${m.doc.t ? ' - ' + m.doc.t : ''}`);
+        });
+        found.ranges.forEach(rg => {
+            addBoxes(rg.start, rg.end, function (e) {
+                pvShowRangeMenu(e, rg.docs, linkCtx.ctx.config);
+            }, `${rg.docs.length} sheets in this range - click to choose`, 'sdx-qol-pv-link-range');
+        });
+    }
+    // Opens a linked sheet in the viewer, remembering where we came from.
+    function pvFollowDocLink(doc, config) {
+        closeRangeMenu();
+        if (pvCurrentMeta) pvHistory.push(pvCurrentMeta);
+        openPdfPreview(doc.i, doc.n || doc.a, config);
+    }
+    function closeRangeMenu() {
+        const existing = document.getElementById('sdx-qol-pv-range-menu');
+        if (existing) existing.remove();
+    }
+    function pvShowRangeMenu(event, docs, config) {
+        closeRangeMenu();
+        const menu = document.createElement('div');
+        menu.id = 'sdx-qol-pv-range-menu';
+        menu.className = 'sdx-qol-pv-rangemenu';
+        docs.forEach(d => {
+            const item = document.createElement('div');
+            item.className = 'sdx-qol-pv-rangemenu-item';
+            item.textContent = `${d.a || d.n}${d.t ? ' - ' + d.t : ''}`;
+            item.addEventListener('click', function (e) {
+                e.stopPropagation();
+                pvFollowDocLink(d, config);
+            });
+            menu.appendChild(item);
+        });
+        document.body.appendChild(menu);
+        const maxLeft = Math.max(8, window.innerWidth - menu.offsetWidth - 12);
+        const maxTop = Math.max(8, window.innerHeight - menu.offsetHeight - 12);
+        menu.style.left = `${Math.min(event.clientX, maxLeft)}px`;
+        menu.style.top = `${Math.min(event.clientY, maxTop)}px`;
+        setTimeout(function () {
+            document.addEventListener('click', closeRangeMenu, { once: true });
+        }, 0);
+    }
+    // ---- "WP Index" button + snapshot ----
+    function injectWpIndexButton() {
+        if (!isTopFrame()) return;
+        const ctx = getWorkPackageContext();
+        const columnsButton = document.getElementById(MANAGER.buttonId);
+        let btn = document.getElementById(WP_BTN_ID);
+        if (!ctx || !columnsButton || !columnsButton.parentElement) {
+            if (btn) btn.remove();
+            return;
+        }
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = WP_BTN_ID;
+            btn.type = 'button';
+            btn.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                runWpIndex();
+            }, true);
+            columnsButton.insertAdjacentElement('afterend', btn);
+        }
+        if (wpIndexBusy) return;
+        const snap = loadWpIndex()[ctx.wp];
+        if (snap) {
+            const when = new Date(snap.savedAt || 0).toLocaleDateString();
+            btn.textContent = `🔗 WP Index ✓ (${(snap.docs || []).length})`;
+            btn.title = `${ctx.wp}: indexed ${when}. Click to refresh. Sheets in this work package get clickable document-number links in the PDF preview viewer.`;
+        } else {
+            btn.textContent = '🔗 WP Index';
+            btn.title = `Index "${ctx.wp}" so document numbers on its sheets become clickable links in the PDF preview viewer.`;
+        }
+    }
+    async function runWpIndex() {
+        const ctx = getWorkPackageContext();
+        const btn = document.getElementById(WP_BTN_ID);
+        if (!ctx || !btn || wpIndexBusy) return;
+        const token = getSdxAuthToken();
+        if (!token) {
+            btn.textContent = '🔗 WP Index - no session token';
+            return;
+        }
+        wpIndexBusy = true;
+        btn.disabled = true;
+        try {
+            const pageSize = 500;
+            const rows = [];
+            let skip = 0;
+            let total = null;
+            const filter = `WP eq '${ctx.wp.replace(/'/g, "''")}'`;
+            for (;;) {
+                btn.textContent = `🔗 Indexing... ${rows.length}${total ? ' / ' + total : ''}`;
+                const url = `${getSdaApiBase()}/${ctx.entityType}?$format=json&$top=${pageSize}&$skip=${skip}&$filter=${encodeURIComponent(filter)}&$count=true`;
+                const data = await pvFetchJson(url, token, ctx.config, { method: 'GET' });
+                const batch = Array.isArray(data.value) ? data.value : [];
+                if (total === null) total = Number(data['@odata.count']) || null;
+                if (rows.length === 0 && batch[0]) {
+                }
+                rows.push(...batch);
+                if (batch.length === 0) break;
+                skip += batch.length;
+                if (total !== null && rows.length >= total) break;
+                if (total === null && batch.length < pageSize) break;
+                if (skip > 5000) break;
+            }
+            const seen = new Set();
+            const docs = [];
+            rows.forEach(r => {
+                const id = r.Id || r.OBID || r.id || null;
+                const key = id || r.Name;
+                if (!key || seen.has(key)) return;
+                seen.add(key);
+                docs.push({
+                    i: id,
+                    n: r.Name || '',
+                    a: r.Alt_Doc_Name || '',
+                    t: String(r.Title || '').slice(0, 90)
+                });
+            });
+            if (!docs.length) throw new Error('no documents returned');
+            if (!docs.some(d => d.i)) throw new Error('rows had no document Id field (see console)');
+            const index = loadWpIndex();
+            index[ctx.wp] = { config: ctx.config, savedAt: Date.now(), docs };
+            if (!saveWpIndex(index)) throw new Error('could not save (browser storage full?)');
+            console.log(`SDx QoL: indexed work package "${ctx.wp}" - ${docs.length} documents`);
+        } catch (err) {
+            console.warn('SDx QoL: WP Index failed', err);
+            btn.textContent = '🔗 WP Index failed';
+            btn.title = `Indexing failed: ${err && err.message ? err.message : err}`;
+            wpIndexBusy = false;
+            btn.disabled = false;
+            return;
+        }
+        wpIndexBusy = false;
+        btn.disabled = false;
+        injectWpIndexButton();
+    }
+    //////////////////////////////////////////////////////////////////////
+    // MODULE 3J
+    // SMART FILTER (type a request, get column filters)
+    //////////////////////////////////////////////////////////////////////
+    // Typing e.g. "8220 civil after sept 20" works out which columns the
+    // words belong to and sets ordinary Kendo data-source filters - the same
+    // thing SDx's own column filter menus do (confirmed via network capture:
+    // contains(To_Contract,'8250'), Issue_Date gt 2026-09-14T..., Disc eq 'MX').
+    // They run on the server, so they cover the whole list, not just the rows
+    // on screen. Existing filters (SDx's own search, the work-package filter,
+    // anything set from the column menus) are kept; only the filters this tool
+    // added are ever replaced or removed. Every interpretation is shown as an
+    // editable chip so a wrong guess is a one-click fix.
+    const SF_WRAP_ID = 'sdx-qol-smart-filter';
+    const SF_PANEL_ID = 'sdx-qol-smart-filter-panel';
+    const SF_MONTH = '(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)';
+    const SF_DATE = '(?:\\d{4}-\\d{1,2}-\\d{1,2}|\\d{1,2}[\\/.\\-]\\d{1,2}(?:[\\/.\\-]\\d{2,4})?|' + SF_MONTH + '\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?|\\d{1,2}(?:st|nd|rd|th)?\\s+' + SF_MONTH + '\\.?(?:,?\\s+\\d{4})?)';
+    const SF_BARE_DATE = '(?:\\d{4}-\\d{1,2}-\\d{1,2}|\\d{1,2}[\\/\\-]\\d{1,2}[\\/\\-]\\d{2,4}|' + SF_MONTH + '\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?)';
+    const SF_STOPWORDS = new Set(['the', 'a', 'an', 'of', 'for', 'and', 'in', 'on', 'with', 'doc', 'docs', 'document', 'documents', 'show', 'me', 'only', 'all', 'at', 'to', 'by', 'engineering', 'management', 'discipline', 'disc', 'or', 'plus', 'contract', 'contracts', 'from', 'supplier', 'vendor']);
+    const SF_STATUS_WORDS = new Set(['approved', 'hold', 'void', 'redline', 'superseded', 'obsolete']);
+    const SF_IP_WORDS = new Set(['ifc', 'ifb', 'ifpc', 'ifa', 'ecn']);
+    // Discipline codes (from the company discipline list) and the words people type for them.
+    const SF_DISC_NAMES = {
+        AA: 'project management and engineering', BA: 'construction', BC: 'commissioning', CB: 'architectural engineering',
+        CG: 'geotechnical engineering', CI: 'infrastructure engineering', CS: 'structural engineering', CX: 'civil engineering',
+        EA: 'electrical engineering', FA: 'cost and planning management', HE: 'environmental', HH: 'health', HP: 'security',
+        HS: 'safety', HX: 'health, safety, environmental and security', IN: 'instrumentation engineering',
+        JA: 'information management', KA: 'information technology', LA: 'pipeline engineering',
+        MH: 'heating, ventilating, and air conditioning', MP: 'piping engineering', MR: 'mechanical rotating engineering',
+        MS: 'mechanical static engineering', MX: 'mechanical engineering', NA: 'maintenance management',
+        OA: 'operations management', PX: 'process engineering', QA: 'quality management', RA: 'materials engineering',
+        SA: 'logistics management', TA: 'telecommunications', UA: 'subsea engineering',
+        VA: 'contracting and procurement management', WA: 'ocean engineering'
+    };
+    const SF_DISC_PREFIX_BLOCK = new Set(['plan', 'pla', 'for', 'new', 'old', 'pro', 'con', 'sec', 'sta', 'sub', 'ins', 'mat', 'ope', 'inf', 'pip']);
+    const SF_DISC_WORDS = {
+        'mechanical rotating': 'MR', 'rotating': 'MR', 'mechanical static': 'MS', 'static': 'MS',
+        'project management': 'AA', 'construction': 'BA', 'commissioning': 'BC', 'architectural': 'CB', 'architecture': 'CB',
+        'geotechnical': 'CG', 'geotech': 'CG', 'infrastructure': 'CI', 'structural': 'CS', 'structure': 'CS', 'civil': 'CX',
+        'electrical': 'EA', 'electric': 'EA', 'cost': 'FA', 'planning': 'FA', 'environmental': 'HE', 'health': 'HH',
+        'security': 'HP', 'safety': 'HS', 'instrumentation': 'IN', 'instrument': 'IN', 'information management': 'JA',
+        'information technology': 'KA', 'pipeline': 'LA', 'hvac': 'MH', 'heating': 'MH', 'ventilation': 'MH',
+        'piping': 'MP', 'pipe': 'MP', 'mechanical': 'MX', 'maintenance': 'NA', 'operations': 'OA', 'process': 'PX',
+        'quality': 'QA', 'materials': 'RA', 'logistics': 'SA', 'telecommunications': 'TA', 'telecom': 'TA',
+        'subsea': 'UA', 'contracting': 'VA', 'procurement': 'VA', 'ocean': 'WA'
+    };
+    const SF_ORG_KEY = `${STORAGE_PREFIX}:sfOrgs`;
+    const SF_ORG_GENERIC = new Set(['north', 'south', 'east', 'west', 'america', 'americas', 'inc', 'llc', 'ltd', 'corp', 'corporation', 'company', 'group', 'systems', 'services', 'engineering', 'power', 'industries', 'international', 'global', 'the', 'and', 'usa', 'energy', 'technologies', 'solutions']);
+    const SF_EXAMPLES = [
+        { text: '8220 civil after sept 20', need: ['To_Contract', 'Disc'] },
+        { text: 'from 8250 to 8220 ifc', need: ['From_Contract', 'To_Contract'] },
+        { text: 'str, arch, civil last 30 days', need: ['Disc'] },
+        { text: 'approved IFC rev 01', need: ['Status', 'IP'] },
+        { text: 'mechanical updated since 9/1', need: ['Disc', 'Last_Updated'] },
+        { text: 'piping before 10/1', need: ['Issue_Date'] },
+        { text: 'supplier wartsila', need: ['Originating_Org'] },
+        { text: '5.8220 review after 10/10', need: ['Item', 'Task'] },
+        { text: 'floor plan MX', need: ['Type'] }
+    ];
+    const SF_ENUM_FIELDS = ['IP', 'Latest_IP', 'Status', 'Disc', 'Disc_Description', 'Type', 'Doc_Rev', 'Originating_Org', 'State'];
+    const smartFilter = { ever: new Set(), total: null, needles: [], lastCols: null, widget: null, text: '', chips: [], applied: [] };
+    function sfMonthIndex(name) {
+        const idx = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].indexOf(String(name).slice(0, 3).toLowerCase());
+        return idx;
+    }
+    function sfDay(y, m, d) {
+        const dt = new Date(y, m, d);
+        return dt.getMonth() === m && dt.getDate() === d ? dt : null; // rejects 2/31 etc.
+    }
+    function sfAddDays(date, n) {
+        return new Date(date.getFullYear(), date.getMonth(), date.getDate() + n);
+    }
+    // Parses one date expression to a local-midnight Date. A missing year means
+    // the current year, or last year if that would land well in the future.
+    function sfParseDate(raw, now) {
+        const s = String(raw).trim().toLowerCase().replace(/,/g, ' ').replace(/\s+/g, ' ');
+        const fixYear = (y, m, d, explicit) => {
+            const year = explicit ? (y < 100 ? 2000 + y : y) : now.getFullYear();
+            let dt = sfDay(year, m, d);
+            if (dt && !explicit && dt.getTime() > now.getTime() + 14 * 86400000) dt = sfDay(year - 1, m, d);
+            return dt;
+        };
+        let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+        if (m) return sfDay(+m[1], +m[2] - 1, +m[3]);
+        m = /^(\d{1,2})[\/.\-](\d{1,2})(?:[\/.\-](\d{2,4}))?$/.exec(s);
+        if (m) return fixYear(m[3] ? +m[3] : 0, +m[1] - 1, +m[2], Boolean(m[3]));
+        m = /^([a-z]{3,9})\.? (\d{1,2})(?:st|nd|rd|th)?(?: (\d{4}))?$/.exec(s);
+        if (m && sfMonthIndex(m[1]) >= 0) return fixYear(m[3] ? +m[3] : 0, sfMonthIndex(m[1]), +m[2], Boolean(m[3]));
+        m = /^(\d{1,2})(?:st|nd|rd|th)? ([a-z]{3,9})\.?(?: (\d{4}))?$/.exec(s);
+        if (m && sfMonthIndex(m[2]) >= 0) return fixYear(m[3] ? +m[3] : 0, sfMonthIndex(m[2]), +m[1], Boolean(m[3]));
+        return null;
+    }
+    // Builds the vocabulary of real column values from the rows currently
+    // loaded in the grid (lowercase -> canonical value, per field).
+    function sfBuildVocab(widget, cols) {
+        const vocab = {};
+        try {
+            const rows = Array.from(widget.dataSource.view()).map(r => (r && r.toJSON ? r.toJSON() : r));
+            // Words found in short text columns such as To Do List "Task" / "RFR" (e.g. review, consolidation).
+            const words = new Map();
+            (cols || []).filter(c => /^(task|rfr)$/i.test(c.title)).forEach(c => {
+                rows.forEach(r => String((r && r[c.field]) || '').toLowerCase().split(/[^a-z0-9]+/).forEach(w => {
+                    if (w.length >= 4 && !words.has(w)) words.set(w, c.field);
+                }));
+            });
+            vocab.words = words;
+            // Originating org (supplier) names: remember what has been seen so a supplier name works even
+            // when none of their documents are on the current page.
+            const orgCol = (cols || []).find(c => c.field === 'Originating_Org') || (cols || []).find(c => /^originating org/i.test(c.title));
+            let orgs = [];
+            try { orgs = JSON.parse(localStorage.getItem(SF_ORG_KEY) || '[]'); } catch (err) { orgs = []; }
+            if (orgCol) {
+                const seen = new Set(orgs);
+                rows.forEach(r => { const v = r && r[orgCol.field]; if (typeof v === 'string' && v.trim()) seen.add(v.trim()); });
+                orgs = Array.from(seen).slice(-300);
+                try { localStorage.setItem(SF_ORG_KEY, JSON.stringify(orgs)); } catch (err) { /* optional */ }
+            }
+            const orgWords = new Map();
+            if (orgCol) orgs.forEach(o => o.toLowerCase().split(/[^a-z0-9]+/).forEach(w => {
+                if (w.length >= 4 && !SF_ORG_GENERIC.has(w) && !orgWords.has(w)) orgWords.set(w, orgCol.field);
+            }));
+            vocab.orgWords = orgWords;
+            SF_ENUM_FIELDS.forEach(field => {
+                const map = new Map();
+                rows.forEach(r => {
+                    const v = r && r[field];
+                    if (typeof v === 'string' && v.trim()) map.set(v.trim().toLowerCase(), v.trim());
+                });
+                if (map.size) vocab[field] = map;
+            });
+        } catch (err) { /* vocabulary is optional */ }
+        return vocab;
+    }
+    const SF_DATE_FIELDS = new Set(['Issue_Date', 'Last_Updated']);
+    function sfGetColumns(widget) {
+        const model = (widget.dataSource.options.schema && widget.dataSource.options.schema.model && widget.dataSource.options.schema.model.fields) || {};
+        const out = new Map();
+        const add = (field, title) => {
+            if (!field || typeof field !== 'string' || out.has(field)) return;
+            const type = (model[field] || {}).type || (SF_DATE_FIELDS.has(field) || /date|updated/i.test(title || field) ? 'date' : 'string');
+            out.set(field, { field, title: normalizeText(title || field.replace(/_/g, ' ')), type });
+        };
+        (widget.columns || []).forEach(c => add(c.field, c.title));
+        try {
+            const el = widget.element && widget.element[0];
+            if (el) el.querySelectorAll('th[data-field]').forEach(th => add(th.getAttribute('data-field'), th.getAttribute('data-title') || th.textContent));
+        } catch (err) { /* optional */ }
+        try {
+            const first = Array.from(widget.dataSource.view())[0];
+            const row = first && first.toJSON ? first.toJSON() : first;
+            if (row) Object.keys(row).forEach(k => { if (/^[A-Za-z][A-Za-z0-9_]*$/.test(k) && typeof row[k] !== 'object') add(k); });
+        } catch (err) { /* optional */ }
+        const cols = Array.from(out.values());
+        if (cols.length) smartFilter.lastCols = cols; // an empty result page has no rows to read keys from
+        return cols.length > 3 ? cols : (smartFilter.lastCols || cols);
+    }
+    // Turns typed text into editable chips: { fields, op, value, kind }.
+    function sfParse(input, cols, vocab, now) {
+        const chips = [];
+        const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const resolve = f => (cols.find(c => c.field === f) || cols.find(c => norm(c.field) === norm(f)) || cols.find(c => norm(c.title) === norm(f)) || {}).field || null;
+        const has = f => Boolean(resolve(f));
+        const firstOf = list => list.find(has) || null;
+        // 2-letter discipline codes are only taken from the original text when typed in capitals (MX, CX...) or after "disc".
+        const upperCodes = new Set((String(input || '').match(/\b[A-Z]{2}\b/g) || []).filter(c => SF_DISC_NAMES[c]));
+        let text = ' ' + String(input || '').toLowerCase().replace(/[“”]/g, '"') + ' ';
+        // ---------- dates ----------
+        const L = '(?<![\\w\\-\\/.])';
+        const R = '(?![\\w\\-\\/])';
+        const DC = L + '(' + SF_DATE + ')' + R;
+        const PFX = '(?:\\b(updated|modified|changed|issued)\\s+)?';
+        function dateField(prefix) {
+            const wanted = /^(updated|modified|changed)$/.test(prefix || '') ? 'Last_Updated' : 'Issue_Date';
+            if (has(wanted)) return wanted;
+            const anyDate = cols.find(c => c.type === 'date');
+            return anyDate ? anyDate.field : null; // e.g. Target Date on the To Do List
+        }
+        function addDate(prefix, op, date) {
+            const field = dateField(prefix);
+            if (!field) return false;
+            chips.push({ fields: [field], op, value: date, kind: 'date' });
+            return true;
+        }
+        function take(re, handler) {
+            text = text.replace(new RegExp(re, 'g'), function () {
+                const m = Array.prototype.slice.call(arguments);
+                return handler(m) ? ' ' : m[0];
+            });
+        }
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        take(PFX + 'between\\s+' + DC + '\\s+and\\s+' + DC, m => {
+            const a = sfParseDate(m[2], now);
+            const b = sfParseDate(m[3], now);
+            if (!a || !b) return false;
+            return addDate(m[1], 'gte', a) && addDate(m[1], 'lt', sfAddDays(b, 1));
+        });
+        take(PFX + '\\bfrom\\s+' + DC + '\\s+(?:to|through|thru|until|-)\\s+' + DC, m => {
+            const a = sfParseDate(m[2], now);
+            const b = sfParseDate(m[3], now);
+            if (!a || !b) return false;
+            return addDate(m[1], 'gte', a) && addDate(m[1], 'lt', sfAddDays(b, 1));
+        });
+        take(PFX + '(?:in the |within the |over the )?(?:last|past)\\s+(\\d+)\\s*(day|week|month|year)s?\\b', m => {
+            const n = +m[2];
+            const from = m[3] === 'day' ? sfAddDays(today, -n)
+                : m[3] === 'week' ? sfAddDays(today, -7 * n)
+                    : m[3] === 'month' ? new Date(today.getFullYear(), today.getMonth() - n, today.getDate())
+                        : new Date(today.getFullYear() - n, today.getMonth(), today.getDate());
+            return addDate(m[1], 'gte', from);
+        });
+        take(PFX + '\\b(today|yesterday|this week|last week|this month|last month)\\b', m => {
+            const w = m[2];
+            const weekStart = sfAddDays(today, -today.getDay());
+            if (w === 'today') return addDate(m[1], 'gte', today);
+            if (w === 'yesterday') return addDate(m[1], 'gte', sfAddDays(today, -1)) && addDate(m[1], 'lt', today);
+            if (w === 'this week') return addDate(m[1], 'gte', weekStart);
+            if (w === 'last week') return addDate(m[1], 'gte', sfAddDays(weekStart, -7)) && addDate(m[1], 'lt', weekStart);
+            const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+            if (w === 'this month') return addDate(m[1], 'gte', monthStart);
+            return addDate(m[1], 'gte', new Date(today.getFullYear(), today.getMonth() - 1, 1)) && addDate(m[1], 'lt', monthStart);
+        });
+        take(PFX + '\\b(after|later than|newer than|since|from|on or after)\\s+' + DC, m => {
+            const d = sfParseDate(m[3], now);
+            if (!d) return false;
+            // "after Sept 20" means later than that day; "since Sept 20" includes it.
+            return /^(after|later than|newer than)$/.test(m[2]) ? addDate(m[1], 'gte', sfAddDays(d, 1)) : addDate(m[1], 'gte', d);
+        });
+        take(PFX + '\\b(before|prior to|earlier than|older than|until|up to|through|thru)\\s+' + DC, m => {
+            const d = sfParseDate(m[3], now);
+            if (!d) return false;
+            return /^(until|up to|through|thru)$/.test(m[2]) ? addDate(m[1], 'lt', sfAddDays(d, 1)) : addDate(m[1], 'lt', d);
+        });
+        take(PFX + '\\bon\\s+' + DC, m => {
+            const d = sfParseDate(m[2], now);
+            return Boolean(d) && addDate(m[1], 'gte', d) && addDate(m[1], 'lt', sfAddDays(d, 1));
+        });
+        take(PFX + L + '(' + SF_BARE_DATE + ')' + R, m => {
+            const d = sfParseDate(m[2], now);
+            return Boolean(d) && addDate(m[1], 'gte', d) && addDate(m[1], 'lt', sfAddDays(d, 1));
+        });
+        // "from 8220" / "to 8250": explicit From Contract / To Contract
+        take('\\b(from|to)\\s+((?:\\d{6}-)?(?:\\d\\.)?\\d{4})(?![\\w.\\-])', m => {
+            const field = m[1] === 'from' ? firstOf(['From_Contract']) : firstOf(['To_Contract', 'Item']);
+            if (!field) return false;
+            chips.push({ fields: [field], op: 'contains', value: field === 'Item' && /^\\d{4}$/.test(m[2]) ? '.' + m[2] : m[2], kind: 'text', note: field === 'Item' ? 'contract' : undefined });
+            return true;
+        });
+        // "supplier wartsila" / "vendor "acme corp"": Originating Org
+        take('\\b(?:supplier|vendor|originator|org|organization)\\s+(?:"([^"]+)"|([a-z0-9&.\\-]+))', m => {
+            const field = firstOf(['Originating_Org']);
+            if (!field) return false;
+            chips.push({ fields: [field], op: 'contains', value: (m[1] || m[2]).trim(), kind: 'text' });
+            return true;
+        });
+        // ---------- words ----------
+        text = text.replace(/[,;]+/g, ' ');
+        const tokens = [];
+        text.replace(/"([^"]+)"|(\S+)/g, (all, quoted, plain) => {
+            tokens.push((quoted || plain).trim());
+            return all;
+        });
+        const typeVocab = vocab.Type || new Map();
+        const ipVocab = vocab.IP || new Map();
+        let i = 0;
+        while (i < tokens.length) {
+            const tok = tokens[i].replace(/^[,;:.]+|[,;:.]+$/g, '');
+            if (!tok) { i++; continue; }
+            // multi-word values (e.g. "floor plan") taken from real Type values
+            let consumed = 0;
+            for (let n = Math.min(4, tokens.length - i); n >= 2 && !consumed; n--) {
+                const phrase = tokens.slice(i, i + n).join(' ');
+                if (has('Type') && typeVocab.has(phrase)) {
+                    chips.push({ fields: ['Type'], op: 'eq', value: typeVocab.get(phrase), kind: 'text' });
+                    consumed = n;
+                }
+            }
+            if (consumed) { i += consumed; continue; }
+            if (SF_STOPWORDS.has(tok)) { i++; continue; }
+            if (has('Disc')) {
+                let hit = 0;
+                for (let n = Math.min(2, tokens.length - i); n >= 1 && !hit; n--) {
+                    const code = SF_DISC_WORDS[tokens.slice(i, i + n).join(' ').replace(/[,;:.]+$/g, '')];
+                    if (code) { chips.push({ fields: ['Disc'], op: 'eq', value: code, kind: 'text', note: SF_DISC_NAMES[code] }); hit = n; }
+                }
+                if (!hit && tok.length >= 3 && !typeVocab.has(tok) && !SF_DISC_PREFIX_BLOCK.has(tok)) {
+                    // abbreviations such as "str", "civ", "elec", "mech" - only when they point at one discipline
+                    const codes = new Set(Object.keys(SF_DISC_WORDS).filter(w => w.indexOf(' ') < 0 && w.length > tok.length && w.startsWith(tok)).map(w => SF_DISC_WORDS[w]));
+                    if (codes.size === 1) {
+                        const code = Array.from(codes)[0];
+                        chips.push({ fields: ['Disc'], op: 'eq', value: code, kind: 'text', note: SF_DISC_NAMES[code] });
+                        hit = 1;
+                    }
+                }
+                if (!hit && /^disc(?:ipline)?$/.test(tok) && tokens[i + 1] && SF_DISC_NAMES[tokens[i + 1].toUpperCase()]) {
+                    const code = tokens[i + 1].toUpperCase();
+                    chips.push({ fields: ['Disc'], op: 'eq', value: code, kind: 'text', note: SF_DISC_NAMES[code] });
+                    hit = 2;
+                }
+                if (!hit && upperCodes.has(tok.toUpperCase()) && tok.length === 2) {
+                    const code = tok.toUpperCase();
+                    chips.push({ fields: ['Disc'], op: 'eq', value: code, kind: 'text', note: SF_DISC_NAMES[code] });
+                    hit = 1;
+                }
+                if (hit) { i += hit; continue; }
+            }
+            // "rev 01" / "rev01"
+            let m = /^rev(?:ision)?(\d{1,2})$/.exec(tok);
+            if (!m && /^rev(?:ision)?$/.test(tok) && /^\d{1,2}$/.test(tokens[i + 1] || '') && has('Doc_Rev')) {
+                m = [null, tokens[i + 1]];
+                i++;
+            }
+            if (m && has('Doc_Rev')) {
+                chips.push({ fields: ['Doc_Rev'], op: 'eq', value: String(m[1]).padStart(2, '0'), kind: 'text' });
+                i++;
+                continue;
+            }
+            // contract numbers: any 4-digit number, 5.8220, 186688-5.8220.
+            // Lists without a To Contract column (To Do List) carry the contract inside "Item" (186688-5.8220-0311).
+            if (/^(?:\d{6}-)?(?:\d\.)?\d{4}$/.test(tok) && (has('To_Contract') || has('Item'))) {
+                if (has('To_Contract')) chips.push({ fields: ['To_Contract'], op: 'contains', value: tok, kind: 'text' });
+                else chips.push({ fields: ['Item'], op: 'contains', value: /^\d{4}$/.test(tok) ? '.' + tok : tok, kind: 'text', note: 'contract' });
+                i++;
+                continue;
+            }
+            // document numbers: prs-com-cp-111, cp-111-01
+            if (/^[a-z0-9]+(?:-[a-z0-9]+){2,}$/.test(tok) && /\d/.test(tok)) {
+                const fields = ['Alt_Doc_Name', 'Name'].filter(has);
+                if (fields.length) {
+                    chips.push({ fields, op: 'contains', value: tok, kind: 'text' });
+                    i++;
+                    continue;
+                }
+            }
+            if (has('Status') && SF_STATUS_WORDS.has(tok)) {
+                chips.push({ fields: ['Status'], op: 'contains', value: tok, kind: 'text' });
+                i++;
+                continue;
+            }
+            if (has('IP') && (SF_IP_WORDS.has(tok) || ipVocab.has(tok))) {
+                chips.push({ fields: ['IP'], op: 'eq', value: (ipVocab.get(tok) || tok.toUpperCase()), kind: 'text' });
+                i++;
+                continue;
+            }
+            if (has('Type') && typeVocab.has(tok)) {
+                chips.push({ fields: ['Type'], op: 'eq', value: typeVocab.get(tok), kind: 'text' });
+                i++;
+                continue;
+            }
+            if (vocab.words && vocab.words.has(tok)) {
+                chips.push({ fields: [vocab.words.get(tok)], op: 'contains', value: tok, kind: 'text' });
+                i++;
+                continue;
+            }
+            if (vocab.orgWords && vocab.orgWords.has(tok)) {
+                chips.push({ fields: [vocab.orgWords.get(tok)], op: 'contains', value: tok, kind: 'text' });
+                i++;
+                continue;
+            }
+            // anything else: a free-text word. Search it across the text columns at once (like SDx's own
+            // search box) so supplier names, titles and document names are all covered.
+            let free = ['Title', 'Name', 'Alt_Doc_Name', 'Originating_Org'].filter(has);
+            if (!has('Name')) free = free.concat(['Item'].filter(has));
+            if (!free.length) free = [(cols.find(c => c.type === 'string') || {}).field].filter(Boolean);
+            if (free.length) chips.push({ fields: free, op: 'contains', value: tok, kind: 'text' });
+            i++;
+        }
+        // Resolve canonical names to the list's real field names, merge repeated discipline words into one OR chip.
+        const disc = chips.filter(c => c.fields.length === 1 && c.fields[0] === 'Disc' && c.op === 'eq');
+        let out = chips;
+        if (disc.length > 1) {
+            const merged = { fields: ['Disc'], op: 'eq', value: disc[0].value, values: Array.from(new Set(disc.map(c => c.value))), kind: 'text', note: Array.from(new Set(disc.map(c => c.note))).join(', ') };
+            out = chips.filter(c => !disc.includes(c));
+            out.push(merged);
+        }
+        out.forEach(c => { c.fields = c.fields.map(f => resolve(f) || f); });
+        return out;
+    }
+    function sfFormatDate(d) {
+        return `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+    }
+    function sfChipLabel(chip, cols) {
+        const title = f => (cols.find(c => c.field === f) || {}).title || f;
+        const where = chip.fields.map(title).join(' / ');
+        if (chip.kind === 'date') {
+            return `${where} ${chip.op === 'lt' ? 'before' : 'on or after'} ${sfFormatDate(chip.value)}`;
+        }
+        if (chip.values && chip.values.length > 1) return `${where} is ${chip.values.join(' or ')}${chip.note ? ' (' + chip.note + ')' : ''}`;
+        return `${where} ${chip.op === 'eq' ? 'is' : 'contains'} "${chip.value}"${chip.note ? ' (' + chip.note + ')' : ''}`;
+    }
+    function sfMark(obj) {
+        try { Object.defineProperty(obj, '__sdxQolSF', { value: true, enumerable: false }); } catch (err) { /* ignore */ }
+        return obj;
+    }
+    function sfToKendo(chip) {
+        return sfMark(sfToKendoRaw(chip));
+    }
+    function sfIsOurs(f) {
+        return Boolean(f && (f.__sdxQolSF || smartFilter.ever.has(sfSig(f))));
+    }
+    function sfToKendoRaw(chip) {
+        const one = field => ({ field, operator: chip.op, value: chip.value });
+        if (chip.values && chip.values.length > 1) {
+            return { logic: 'or', filters: chip.values.map(v => ({ field: chip.fields[0], operator: chip.op, value: v })) };
+        }
+        return chip.fields.length === 1 ? one(chip.fields[0]) : { logic: 'or', filters: chip.fields.map(one) };
+    }
+    // Signature of a filter item that ignores the "logic" key Kendo adds.
+    function sfSig(f) {
+        if (!f) return '';
+        if (Array.isArray(f.filters)) return `G${f.logic || 'and'}[${f.filters.map(sfSig).join(',')}]`;
+        const v = f.value instanceof Date ? f.value.toISOString() : f.value;
+        return `${f.field}|${f.operator}|${v}`;
+    }
+    function sfTopFilter(ds) {
+        const cur = ds.filter();
+        if (!cur) return { logic: 'and', filters: [] };
+        if (Array.isArray(cur.filters)) return { logic: cur.logic || 'and', filters: cur.filters.slice() };
+        return { logic: 'and', filters: [cur] };
+    }
+    // Replaces ONLY the filters this tool previously added with the current chips.
+    function sfApplyToGrid(widget) {
+        const ds = widget.dataSource;
+        const top = sfTopFilter(ds);
+        const previousNeedles = smartFilter.needles;
+        let kept = top.filters.filter(f => !sfIsOurs(f));
+        if (top.logic === 'or') kept = [{ logic: 'or', filters: kept }]; // keep an OR group intact
+        const added = smartFilter.chips.map(sfToKendo);
+        smartFilter.applied = added.map(sfSig);
+        smartFilter.applied.forEach(sig => smartFilter.ever.add(sig));
+        smartFilter.needles = smartFilter.chips.filter(c => c.kind === 'text').reduce((acc, c) => acc.concat(c.values || [c.value]), []).map(v => String(v).toLowerCase());
+        smartFilter.total = null;
+        const merged = kept.concat(added);
+        ds.filter(merged.length ? { logic: 'and', filters: merged } : null);
+        sfBindTotalKeeper(widget);
+        sfRefreshCountSoon(widget, smartFilter.needles, smartFilter.needles.length ? [] : previousNeedles);
+    }
+    // Pushes a new total into the grid's pager. Tries the widgets first, then (if the footer text is still
+    // the old number) rewrites the footer text itself.
+    function sfShowTotal(widget, total) {
+        const ds = widget.dataSource;
+        ds._total = total;
+        const pagerEls = [...document.querySelectorAll('.k-pager, .k-grid-pager, .k-pager-wrap, [data-role="pager"]')];
+        const widgets = new Set();
+        if (widget.pager) widgets.add(widget.pager);
+        pagerEls.forEach(el => { const w = getKendoWidgetFromElement(el, ['kendoPager']); if (w) widgets.add(w); });
+        widgets.forEach(w => { try { if (typeof w.refresh === 'function') w.refresh(); } catch (err) { /* cosmetic */ } });
+        setTimeout(function () {
+            const pageSize = (typeof ds.pageSize === 'function' && ds.pageSize()) || 0;
+            const pagerEl = getLikelyMainPager();
+            if (!pagerEl) return;
+            const info = pagerEl.querySelector('.k-pager-info') || pagerEl;
+            const shown = parsePagerInfo(pagerEl);
+            if (shown.total === total) return;
+            // The widgets did not update the footer: rewrite it.
+            const first = total ? 1 : 0;
+            const last = pageSize ? Math.min(pageSize, total) : total;
+            const walker = document.createTreeWalker(info, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                if (/\d+\s*-\s*\d+\s*of\s*\d+/i.test(node.nodeValue)) {
+                    node.nodeValue = node.nodeValue.replace(/\d+\s*-\s*\d+(\s*of\s*)\d+/i, `${first} - ${last}$1${total}`);
+                }
+            }
+            const pages = pageSize ? Math.max(1, Math.ceil(total / pageSize)) : 1;
+            const pw = document.createTreeWalker(pagerEl, NodeFilter.SHOW_TEXT);
+            while ((node = pw.nextNode())) {
+                if (/^\s*of\s+\d+\s*$/i.test(node.nodeValue)) node.nodeValue = node.nodeValue.replace(/\d+/, String(pages));
+            }
+            // Page boxes/buttons: go back to page 1 and disable paging when everything fits.
+            const input = pagerEl.querySelector('input');
+            if (input && !/^\d+$/.test(String(input.value || '').trim())) input.value = '1';
+        }, 150);
+    }
+    // Paging inside a filtered list makes SDx's own code write its old total back; put ours back after any change.
+    function sfBindTotalKeeper(widget) {
+        const ds = widget.dataSource;
+        if (ds.__sdxQolSFBound || typeof ds.bind !== 'function') return;
+        ds.__sdxQolSFBound = true;
+        ds.bind('change', function () {
+            if (smartFilter.total === null || !smartFilter.chips.length || smartFilter.widget !== widget) return;
+            setTimeout(function () {
+                if (smartFilter.total !== null && ds.total() !== smartFilter.total) sfShowTotal(widget, smartFilter.total);
+            }, 40);
+        });
+    }
+    // SDx loads rows with $count=false and fetches the total separately, but only when one of ITS filter
+    // menus is used. After we change the filter ourselves, ask for the matching total the same way and
+    // push it into the data source and pager so "1 - 250 of N items" is right.
+    let sfCountSeq = 0;
+    function sfRefreshCountSoon(widget, needles, avoid) {
+        const seq = ++sfCountSeq;
+        const startedAt = Date.now();
+        let tries = 0;
+        const poll = function () {
+            if (seq !== sfCountSeq) return;
+            // SDx writes OData options percent-encoded (%24top, %24count), so accept both spellings.
+            const reTop0 = /[?&](?:\$|%24)top=0(?!\d)/i;
+            const reCountTrue = /[?&](?:\$|%24)count=true/i;
+            const reCountFalse = /[?&](?:\$|%24)count=false/i;
+            let fresh = recentReads.filter(r => r.t >= startedAt - 50);
+            // Fallback: the browser's own resource list, in case the page's requests bypass our wrappers.
+            try {
+                const origin = performance.timeOrigin || 0;
+                performance.getEntriesByType('resource').forEach(e => {
+                    if ((e.initiatorType === 'xmlhttprequest' || e.initiatorType === 'fetch') && origin + e.startTime >= startedAt - 50 && /\/api\/v2\//i.test(e.name) && /(?:\$|%24)top=/i.test(e.name)) {
+                        fresh.push({ url: e.name, headers: {}, t: origin + e.startTime });
+                    }
+                });
+            } catch (err) { /* optional */ }
+            fresh = fresh.sort((x, y) => x.t - y.t);
+            // SDx made its own count call: nothing to do.
+            if (fresh.some(r => reCountTrue.test(r.url) && reTop0.test(r.url))) return;
+            // Only trust a list request that really carries this filter (not an older or unfiltered one).
+            const decoded = r => { try { return decodeURIComponent(r.url).toLowerCase(); } catch (err) { return r.url.toLowerCase(); } };
+            const rows = fresh.filter(r => reCountFalse.test(r.url))
+                .filter(r => (needles || []).every(n => decoded(r).includes(n)))
+                .filter(r => !(avoid || []).some(n => decoded(r).includes(n)))
+                .pop();
+            if (!rows) {
+                if (++tries < 50) setTimeout(poll, 250);
+                else console.warn('SDx QoL smart filter: no list request seen after applying the filter; item count not refreshed');
+                return;
+            }
+            const url = rows.url
+                .replace(/([?&](?:\$|%24)top=)\d+/i, '$10')
+                .replace(/([?&])(?:\$|%24)skip=\d+&?/i, '$1')
+                .replace(/(?:\$|%24)count=false/i, '$count=true')
+                .replace(/[?&]$/, '');
+            const headers = Object.assign({ Accept: 'application/json' }, rows.headers);
+            if (!readHeaderCaseInsensitive(headers, 'authorization')) {
+                const token = getSdxAuthToken();
+                if (token) headers.Authorization = `Bearer ${token}`;
+            }
+            fetch(url, { headers, credentials: 'include' })
+                .then(r => (r.ok ? r.json() : Promise.reject(new Error('HTTP ' + r.status))))
+                .then(j => {
+                    if (seq !== sfCountSeq) return;
+                    const n = [j['@odata.count'], j['odata.count'], j.count, j.Count].find(v => Number.isFinite(Number(v)) && v !== null && v !== undefined);
+                    if (n === undefined) return;
+                    widget.dataSource._total = Number(n);
+                    smartFilter.total = smartFilter.chips.length ? Number(n) : null;
+                    sfShowTotal(widget, Number(n));
+                })
+                .catch(err => console.warn('SDx QoL smart filter: could not refresh the item count', err));
+        };
+        setTimeout(poll, 120);
+    }
+    function sfGetWidget() {
+        // Keep the grid we already know while it is on the page, even with zero rows showing.
+        const known = smartFilter.widget;
+        if (known && known.element && known.element[0] && known.element[0].isConnected) return known;
+        let best = null;
+        let bestScore = -1;
+        document.querySelectorAll('.k-grid').forEach(gridEl => {
+            const widget = getKendoWidgetFromElement(gridEl, ['kendoGrid']);
+            if (!widget || !widget.dataSource || typeof widget.dataSource.filter !== 'function') return;
+            const score = (gridEl.querySelector('tr[data-uid]') ? 1000 : 0) + (widget.columns || []).length;
+            if (score > bestScore) { best = widget; bestScore = score; }
+        });
+        return best;
+    }
+    function sfRunText(text) {
+        const widget = sfGetWidget();
+        if (!widget) return;
+        smartFilter.widget = widget;
+        smartFilter.text = text;
+        const cols = sfGetColumns(widget);
+        smartFilter.chips = sfParse(text, cols, sfBuildVocab(widget, cols), new Date());
+        console.log('SDx QoL smart filter:', text, '->', smartFilter.chips.map(c => `${c.fields.join('/')} ${c.op} ${c.values ? c.values.join('|') : (c.value instanceof Date ? c.value.toISOString() : c.value)}`));
+        sfApplyToGrid(widget);
+        sfRenderPanel(true);
+    }
+    function sfClearAll() {
+        const widget = smartFilter.widget || sfGetWidget();
+        smartFilter.chips = [];
+        if (widget) sfApplyToGrid(widget);
+        smartFilter.applied = [];
+        smartFilter.total = null;
+        smartFilter.text = '';
+        const input = document.querySelector('#' + SF_WRAP_ID + ' input');
+        if (input) input.value = '';
+        sfRenderPanel(false);
+        sfUpdateBadge();
+    }
+    function sfReapply() {
+        const widget = smartFilter.widget || sfGetWidget();
+        if (!widget) return;
+        sfApplyToGrid(widget);
+        sfRenderPanel(true);
+    }
+    function sfCloseOnOutsideClick(e) {
+        const panel = document.getElementById(SF_PANEL_ID);
+        const wrap = document.getElementById(SF_WRAP_ID);
+        if (!panel) return;
+        if (panel.contains(e.target) || (wrap && wrap.contains(e.target))) return;
+        panel.remove();
+    }
+    function sfUpdateBadge() {
+        const badge = document.querySelector('#' + SF_WRAP_ID + ' .sdx-qol-sf-badge');
+        if (!badge) return;
+        const n = smartFilter.chips.length;
+        badge.textContent = n ? `${n} filter${n === 1 ? '' : 's'}` : '';
+        badge.style.display = n ? '' : 'none';
+        const clear = document.querySelector('#' + SF_WRAP_ID + ' .sdx-qol-sf-clear');
+        const input = document.querySelector('#' + SF_WRAP_ID + ' input');
+        if (clear) clear.style.display = (n || (input && input.value)) ? '' : 'none';
+    }
+    // Shows the chips (editable) under the input.
+    function sfRenderPanel(show) {
+        sfUpdateBadge();
+        let panel = document.getElementById(SF_PANEL_ID);
+        if (!show) {
+            if (panel) panel.remove();
+            return;
+        }
+        const wrap = document.getElementById(SF_WRAP_ID);
+        const widget = smartFilter.widget;
+        if (!wrap || !widget) return;
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = SF_PANEL_ID;
+            document.body.appendChild(panel);
+            setTimeout(function () { document.addEventListener('click', sfCloseOnOutsideClick); }, 0);
+        }
+        const rect = wrap.getBoundingClientRect();
+        panel.style.top = `${rect.bottom + 4}px`;
+        panel.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 460))}px`;
+        panel.textContent = '';
+        const cols = sfGetColumns(widget);
+        const title = document.createElement('div');
+        title.className = 'sdx-qol-sf-title';
+        title.textContent = smartFilter.chips.length ? 'Filters applied (change a column or remove one to adjust)' : 'Nothing recognised - try e.g. "8220 civil after sept 20"';
+        panel.appendChild(title);
+        smartFilter.chips.forEach((chip, idx) => {
+            const row = document.createElement('div');
+            row.className = 'sdx-qol-sf-chip';
+            const label = document.createElement('span');
+            label.className = 'sdx-qol-sf-chip-label';
+            label.textContent = sfChipLabel(chip, cols);
+            row.appendChild(label);
+            // Column picker: only columns of a compatible type.
+            const select = document.createElement('select');
+            const compatible = cols.filter(c => (chip.kind === 'date' ? c.type === 'date' : c.type !== 'date'));
+            compatible.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.field;
+                opt.textContent = c.title;
+                if (chip.fields.length === 1 && chip.fields[0] === c.field) opt.selected = true;
+                select.appendChild(opt);
+            });
+            if (chip.fields.length > 1) {
+                const first = document.createElement('option');
+                first.value = '';
+                first.textContent = '(several columns)';
+                first.selected = true;
+                select.insertBefore(first, select.firstChild);
+            }
+            select.title = 'Search a different column';
+            select.addEventListener('change', function () {
+                if (!select.value) return;
+                chip.fields = [select.value];
+                sfReapply();
+            });
+            row.appendChild(select);
+            const remove = document.createElement('button');
+            remove.type = 'button';
+            remove.textContent = '×';
+            remove.title = 'Remove this filter';
+            remove.addEventListener('click', function () {
+                smartFilter.chips.splice(idx, 1);
+                sfReapply();
+            });
+            row.appendChild(remove);
+            panel.appendChild(row);
+        });
+        const foot = document.createElement('div');
+        foot.className = 'sdx-qol-sf-foot';
+        const clearBtn = document.createElement('button');
+        clearBtn.type = 'button';
+        clearBtn.textContent = 'Clear all';
+        clearBtn.addEventListener('click', sfClearAll);
+        foot.appendChild(clearBtn);
+        panel.appendChild(foot);
+    }
+    function injectSmartFilter() {
+        if (!isTopFrame()) return;
+        const columnsButton = document.getElementById(MANAGER.buttonId);
+        let wrap = document.getElementById(SF_WRAP_ID);
+        const widget = sfGetWidget();
+        if (!columnsButton || !columnsButton.parentElement || !widget) {
+            if (wrap) wrap.remove();
+            return;
+        }
+        // A different grid means a different list: forget this tool's state.
+        if (smartFilter.widget && smartFilter.widget !== widget) {
+            smartFilter.chips = [];
+            smartFilter.applied = [];
+            smartFilter.text = '';
+            smartFilter.widget = null;
+            sfRenderPanel(false);
+            const input = wrap && wrap.querySelector('input');
+            if (input) input.value = '';
+        }
+        // If SDx replaced the filters (e.g. a new search), drop chips that are no longer applied.
+        if (smartFilter.chips.length && smartFilter.widget === widget) {
+            if (!sfTopFilter(widget.dataSource).filters.some(sfIsOurs)) {
+                smartFilter.chips = [];
+                smartFilter.applied = [];
+                smartFilter.total = null;
+                sfRenderPanel(false);
+            }
+        }
+        if (!wrap) {
+            wrap = document.createElement('div');
+            wrap.id = SF_WRAP_ID;
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.placeholder = 'Smart filter: 8220 civil after sept 20';
+            input.title = 'Type what you want to see, then press Enter or click Apply. Words are matched to columns (contract numbers, discipline, status, dates, titles...).';
+            input.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    try { sfRunText(input.value); } catch (err) { console.error('SDx QoL smart filter failed:', err); }
+                } else if (e.key === 'Escape') {
+                    input.blur();
+                }
+            });
+            // keep the page's keyboard shortcuts from reacting while typing
+            input.addEventListener('keyup', function (e) { e.stopPropagation(); });
+            const badge = document.createElement('button');
+            badge.type = 'button';
+            badge.className = 'sdx-qol-sf-badge';
+            badge.style.display = 'none';
+            badge.title = 'Show / edit the filters this tool applied';
+            badge.addEventListener('click', function (e) {
+                e.stopPropagation();
+                const open = document.getElementById(SF_PANEL_ID);
+                if (open) open.remove(); else sfRenderPanel(true);
+            });
+            input.addEventListener('input', sfUpdateBadge);
+            const apply = document.createElement('button');
+            apply.type = 'button';
+            apply.className = 'sdx-qol-sf-apply';
+            apply.textContent = 'Apply';
+            apply.title = 'Apply the smart filter (same as pressing Enter)';
+            apply.addEventListener('click', function () {
+                try { sfRunText(input.value); } catch (err) { console.error('SDx QoL smart filter failed:', err); }
+            });
+            const clear = document.createElement('button');
+            clear.type = 'button';
+            clear.className = 'sdx-qol-sf-clear';
+            clear.textContent = 'Clear';
+            clear.title = 'Clear the smart filter text and the filters it applied';
+            clear.style.display = 'none';
+            clear.addEventListener('click', sfClearAll);
+            wrap.appendChild(input);
+            wrap.appendChild(apply);
+            wrap.appendChild(badge);
+            wrap.appendChild(clear);
+        }
+        if (!wrap.isConnected) {
+            const parent = columnsButton.parentElement;
+            parent.insertBefore(wrap, parent.firstChild);
+        }
+        if (smartFilter.text && !wrap.querySelector('input').value) wrap.querySelector('input').value = smartFilter.text;
+        sfUpdateBadge();
+        sfStartExampleRotation();
+    }
+    // Cycles example phrases through the (empty) input's placeholder so new users see what it understands.
+    let sfExampleTimer = null;
+    let sfExampleIndex = 0;
+    function sfTickExample() {
+        const input = document.querySelector('#' + SF_WRAP_ID + ' input');
+        if (!input) return;
+        if (input.value || document.activeElement === input) return;
+        const widget = smartFilter.widget || sfGetWidget();
+        const cols = widget ? sfGetColumns(widget) : [];
+        const norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const hasCol = f => cols.some(c => norm(c.field) === norm(f) || norm(c.title) === norm(f));
+        const usable = SF_EXAMPLES.filter(ex => ex.need.every(hasCol));
+        const list = usable.length ? usable : SF_EXAMPLES.slice(0, 1);
+        sfExampleIndex = (sfExampleIndex + 1) % list.length;
+        input.placeholder = 'Smart filter - try: ' + list[sfExampleIndex].text;
+    }
+    function sfStartExampleRotation() {
+        if (sfExampleTimer) return;
+        sfExampleTimer = setInterval(sfTickExample, 4000);
+    }
+    //////////////////////////////////////////////////////////////////////
     // MODULE 4
     // PAGE REFRESH HANDLER
     //////////////////////////////////////////////////////////////////////
@@ -3938,6 +5243,8 @@
         applyRowHighlighting();
         maybeSuppressStepDetailsPanel();
         injectDlFilesButton();
+        injectWpIndexButton();
+        injectSmartFilter();
         // Icons are added only after the grid has been quiet for a moment, so
         // we never inject into intermediate renders that SDx is about to
         // throw away (and never add DOM churn mid-render).
@@ -3947,7 +5254,6 @@
     function refreshQoL() {
         injectStyles();
         injectManagerButton();
-        injectSessionButton();
         applyGridCustomizations();
         if (location.href !== lastUrl) {
             lastUrl = location.href;
@@ -3957,7 +5263,6 @@
             lastAppliedPageSize = null;
             setTimeout(function () {
                 injectManagerButton();
-                injectSessionButton();
                 applyGridCustomizations();
             }, 1200);
         }
