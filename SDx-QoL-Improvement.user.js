@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.8
+// @version      1.9
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), in-page PDF preview with next/previous, search, zoom, fit, print and download, work package indexing that turns document numbers on sheets into clickable links, and a typed smart filter for any list.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
@@ -34,7 +34,7 @@
     };
     const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
     const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
-    console.log(`${SCRIPT_NAME} v1.8 loaded`);
+    console.log(`${SCRIPT_NAME} v1.9 loaded`);
     //////////////////////////////////////////////////////////////////////
     // MODULE 0
     // EARLY KENDO DATASOURCE HOOK (page size)
@@ -749,12 +749,76 @@
         document.querySelectorAll(ROW_HIGHLIGHT_CLASSES.map(c => `.${c}`).join(', '))
             .forEach(row => row.classList.remove(...ROW_HIGHLIGHT_CLASSES));
     }
+    // The To Do List grid has frozen columns, so every record is drawn as TWO table rows (frozen part and
+    // scrolling part) that share a data-uid. The colour must go on both, otherwise the frozen cells stay white.
+    // Returns false when the grid's columns could not be identified (the caller then falls back to cell text).
+    function applyRowHighlightingFromData(hl) {
+        const widget = typeof sfGetWidget === 'function' ? sfGetWidget() : null;
+        if (!widget || !widget.dataSource || !widget.element || !widget.element[0]) return false;
+        const colFor = word => (widget.columns || []).find(c => c.field && String(c.title || c.field).toLowerCase().includes(word));
+        const dateCol = colFor('target date');
+        const doneCol = colFor('completion');
+        const rfrCol = colFor('rfr');
+        if (!dateCol && !(doneCol && rfrCol)) return false;
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const gridEl = widget.element[0];
+        Array.from(widget.dataSource.view()).forEach(item => {
+            if (!item || !item.uid) return;
+            let cls = null;
+            if (hl.overdueEnabled && dateCol) {
+                const raw = item[dateCol.field];
+                const d = raw instanceof Date ? new Date(raw.getTime()) : new Date(raw);
+                if (raw && !Number.isNaN(d.getTime())) {
+                    d.setHours(0, 0, 0, 0);
+                    if (d.getTime() < today.getTime()) cls = 'sdx-qol-row-overdue';
+                }
+            }
+            if (!cls && (hl.lowCompletionEnabled || hl.highCompletionEnabled) && doneCol && rfrCol && isConsolidationRfr(String(item[rfrCol.field] == null ? '' : item[rfrCol.field]))) {
+                const value = parseCompletionPercent(String(item[doneCol.field] == null ? '' : item[doneCol.field]));
+                if (value !== null) {
+                    if (hl.lowCompletionEnabled && value < hl.lowCompletionThreshold) cls = 'sdx-qol-row-low-completion';
+                    else if (hl.highCompletionEnabled && value > hl.highCompletionThreshold) cls = 'sdx-qol-row-high-completion';
+                }
+            }
+            if (!cls) return;
+            gridEl.querySelectorAll(`tr[data-uid="${item.uid}"]`).forEach(tr => tr.classList.add(cls));
+        });
+        return true;
+    }
+    // A task is two table rows (frozen + scrolling halves). Hovering one half only hovers that half, so mirror
+    // the hover onto its partner so the darker "you are here" colour spans the whole record.
+    (function installRowHoverSync() {
+        const selector = ROW_HIGHLIGHT_CLASSES.map(c => `tr.${c}`).join(', ');
+        let hovered = [];
+        const clear = () => { hovered.forEach(tr => tr.classList.remove('sdx-qol-row-hover')); hovered = []; };
+        window.addEventListener('mouseover', function (e) {
+            const tr = e.target && e.target.closest ? e.target.closest('tr[data-uid]') : null;
+            if (!tr || !tr.matches(selector)) { if (hovered.length) clear(); return; }
+            if (hovered.includes(tr)) return;
+            clear();
+            const grid = tr.closest('.k-grid');
+            if (!grid) return;
+            grid.querySelectorAll(`tr[data-uid="${tr.getAttribute('data-uid')}"]`).forEach(other => {
+                if (other !== tr) { other.classList.add('sdx-qol-row-hover'); hovered.push(other); }
+            });
+            hovered.push(tr);
+        }, true);
+        window.addEventListener('mouseout', function (e) {
+            if (!e.relatedTarget || !e.relatedTarget.closest || !e.relatedTarget.closest('.k-grid')) clear();
+        }, true);
+    })();
     function applyRowHighlighting() {
         clearRowHighlighting();
         if (getPageType() !== 'todo-list') return;
         const settings = loadSettings();
         const hl = settings.rowHighlighting;
         if (!hl.overdueEnabled && !hl.lowCompletionEnabled && !hl.highCompletionEnabled) return;
+        try {
+            if (applyRowHighlightingFromData(hl)) return;
+        } catch (err) {
+            console.warn('SDx QoL: row highlighting from grid data failed, using cell text', err);
+        }
         const headers = getHeaderCells();
         if (headers.length === 0) return;
         const targetDateIdx = findColumnIndexByName(headers, ['target date']);
@@ -1333,6 +1397,23 @@
             .sdx-qol-row-high-completion > [role="gridcell"],
             .sdx-qol-row-high-completion > [role="cell"] {
                 background-color: #e6f4ea !important;
+            }
+            .sdx-qol-row-overdue:hover > td,
+            .sdx-qol-row-overdue.sdx-qol-row-hover > td { background-color: #f6c3be !important; }
+            .sdx-qol-row-low-completion:hover > td,
+            .sdx-qol-row-low-completion.sdx-qol-row-hover > td { background-color: #fbdcae !important; }
+            .sdx-qol-row-high-completion:hover > td,
+            .sdx-qol-row-high-completion.sdx-qol-row-hover > td { background-color: #c3e3cc !important; }
+            td.sdx-qol-pv-todo-cell {
+                position: relative !important;
+                padding-right: 32px !important;
+            }
+            td.sdx-qol-pv-todo-cell > .sdx-qol-pv-btn {
+                position: absolute !important;
+                right: 6px !important;
+                top: 50% !important;
+                transform: translateY(-50%) !important;
+                margin: 0 !important;
             }
             #${DL_BUTTON_ID} {
                 margin-left: 8px !important;
@@ -3083,8 +3164,8 @@
     }
     function injectPreviewButtons() {
         if (!isTopFrame()) return;
-        if (getPageType() === 'todo-list') return;
         if (!loadViewerSettings().enabled) return;
+        const todo = getPageType() === 'todo-list';
         document.querySelectorAll('.k-grid').forEach(gridEl => {
             const widget = getKendoWidgetFromElement(gridEl, ['kendoGrid']);
             if (!widget || typeof widget.dataItem !== 'function') return;
@@ -3093,9 +3174,14 @@
                 let item = null;
                 try { item = widget.dataItem(row); } catch (err) { item = null; }
                 if (!item) return;
-                const obid = item.OBID || item.Id;
-                const name = normalizeText(item.Name || item.CI_Name || '');
+                // To Do List rows are workflow tasks; the document behind the task is in the Dyn* fields
+                // (confirmed from a row dump): DynWorkflowItemOBID / DynWorkflowItemName / DynWorkflowItemConfig.
+                const obid = todo ? item.DynWorkflowItemOBID : (item.OBID || item.Id);
+                const name = todo
+                    ? normalizeText(item.CI_WorkflowItem || item.DynWorkflowItemName || '')
+                    : normalizeText(item.Name || item.CI_Name || '');
                 if (!obid || !name) return;
+                if (todo && item.iconName && !/document/i.test(String(item.iconName))) return; // task on something other than a document
                 // Mark every processed <tr> (even the half with no link) so
                 // later refresh passes skip it cheaply.
                 row.setAttribute('data-sdx-qol-pv', '1');
@@ -3104,9 +3190,13 @@
                 // Confirmed live: the name is rendered as
                 // <span class="grid-object__name">, not an <a>. Anchors are
                 // kept as a fallback for other grids.
-                const link = [...row.querySelectorAll('.grid-object__name, td a')].find(a => normalizeText(a.textContent) === name);
+                // To Do List: the eye goes in the "Title" cell (the document title), pinned to its right edge.
+                const todoText = todo ? (normalizeText(item.CI_bmcdWorkflowItemDesc || '') || name) : '';
+                const link = todo
+                    ? [...row.querySelectorAll('td')].find(td => normalizeText(td.textContent) === todoText)
+                    : [...row.querySelectorAll('.grid-object__name, td a')].find(a => normalizeText(a.textContent) === name);
                 if (!link) return;
-                if (link.parentElement && link.parentElement.querySelector('.' + PV_BTN_CLASS)) return;
+                if (todo ? link.querySelector('.' + PV_BTN_CLASS) : (link.parentElement && link.parentElement.querySelector('.' + PV_BTN_CLASS))) return;
                 const btn = document.createElement('span');
                 btn.className = PV_BTN_CLASS;
                 btn.setAttribute('role', 'button');
@@ -3114,8 +3204,9 @@
                 btn.innerHTML = PV_ICON_SVG;
                 btn.dataset.obid = obid;
                 btn.dataset.name = name;
-                btn.dataset.config = item.Config || item.SPFConfigUID || '';
-                link.insertAdjacentElement('afterend', btn);
+                btn.dataset.config = (todo ? item.DynWorkflowItemConfig : (item.Config || item.SPFConfigUID)) || '';
+                if (todo) { link.classList.add('sdx-qol-pv-todo-cell'); link.appendChild(btn); }
+                else link.insertAdjacentElement('afterend', btn);
             });
         });
         if (pvLastObid !== null) pvRefreshActiveHighlight();
@@ -3931,6 +4022,55 @@
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         return resp.json();
     }
+    // Finds the file to preview for an object. Document-list rows are document VERSIONS whose viewable file is
+    // reached through SPFFileComposition_21. A To Do List task points at the document REVISION instead (confirmed:
+    // class FDWDocumentRevision, zero files, and its other file/version relationships are rejected by SDx with
+    // HTTP 400). So when the direct lookup is empty, the matching document-list row (the same record the document
+    // lists show) is found by document number and its id is used. The list entity name is taken from list requests
+    // SDx has already made on this page when available, else the standard one.
+    function pvListEntityName() {
+        for (let i = recentReads.length - 1; i >= 0; i--) {
+            const m = /\/api\/v2\/SDA\/(AllDocuments_\d+)/i.exec(recentReads[i].url);
+            if (m) return m[1];
+        }
+        return 'AllDocuments_68290';
+    }
+    async function pvFindViewableFile(obid, token, config, stale, name) {
+        const api = getSdaApiBase();
+        const viewFilter = `$filter=${encodeURIComponent('SPFViewInd eq true')}&$top=5&$count=true`;
+        const trail = [];
+        const pick = list => {
+            const files = (Array.isArray(list) ? list : []).filter(f => f && f.OBID);
+            return files.find(f => /\.pdf$/i.test(String(f.Name || f.CI_Name || ''))) || files[0] || null;
+        };
+        const read = async (url, label) => {
+            try {
+                const data = await pvFetchJson(url, token, config, { method: 'GET' });
+                const rows = data && Array.isArray(data.value) ? data.value : [];
+                trail.push(`${label}: ${rows.length}`);
+                return rows;
+            } catch (err) {
+                trail.push(`${label}: ${err && err.message ? err.message : 'error'}`);
+                return [];
+            }
+        };
+        const filesOf = id => read(`${api}/Objects('${encodeURIComponent(id)}')/SPFFileComposition_21?${viewFilter}`, `SPFFileComposition_21(${id})`);
+        let file = pick(await filesOf(obid));
+        if (file || stale() || !name) return { file, trail };
+        // Revision -> the document-list record with the same document number.
+        const entity = pvListEntityName();
+        const filter = encodeURIComponent(`Name eq '${String(name).replace(/'/g, "''")}'`);
+        const rows = await read(`${api}/${entity}?$filter=${filter}&$top=5`, `${entity} by name`);
+        if (stale()) return { file: null, trail };
+        const ordered = rows.slice().sort((x, y) => (String(y.Config || '') === String(config || '')) - (String(x.Config || '') === String(config || '')));
+        for (const row of ordered) {
+            const id = row && (row.Id || row.OBID);
+            if (!id || id === obid) continue;
+            file = pick(await filesOf(id));
+            if (file || stale()) break;
+        }
+        return { file, trail };
+    }
     async function openPdfPreview(obid, name, config) {
         const ui = buildPreviewModal(name);
         pvCurrentObid = obid;
@@ -3955,11 +4095,11 @@
         }
         try {
             // Step 1: document -> viewable file OBID
-            const compUrl = `${getSdaApiBase()}/Objects('${encodeURIComponent(obid)}')/SPFFileComposition_21?$filter=${encodeURIComponent('SPFViewInd eq true')}&$top=1&$count=true`;
-            const comp = await pvFetchJson(compUrl, token, config, { method: 'GET' });
+            const found = await pvFindViewableFile(obid, token, config, stale, name);
             if (stale()) return;
-            const fileItem = comp && Array.isArray(comp.value) ? comp.value[0] : null;
+            const fileItem = found.file;
             if (!fileItem || !fileItem.OBID) {
+                console.warn('SDx QoL: no viewable file found for', name, obid, '| tried:', found.trail.join(' ; '));
                 fail('This item has no viewable file to preview.');
                 return;
             }
