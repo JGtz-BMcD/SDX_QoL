@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.9
+// @version      1.10
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), in-page PDF preview with next/previous, search, zoom, fit, print and download, work package indexing that turns document numbers on sheets into clickable links, and a typed smart filter for any list.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
@@ -34,7 +34,7 @@
     };
     const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
     const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
-    console.log(`${SCRIPT_NAME} v1.9 loaded`);
+    console.log(`${SCRIPT_NAME} v1.10 loaded`);
     //////////////////////////////////////////////////////////////////////
     // MODULE 0
     // EARLY KENDO DATASOURCE HOOK (page size)
@@ -1782,7 +1782,7 @@
         const all = [...document.querySelectorAll('button, a, span, div')];
         const exportEl = all.find(el => {
             const text = normalizeText(el.innerText || el.textContent || '');
-            return /^export all to excel$/i.test(text);
+            return /^export (all )?(rows |data )?to excel$/i.test(text) || /^export all$/i.test(text);
         });
         if (exportEl) {
             const buttonLike = exportEl.closest('button, a') || exportEl;
@@ -1805,10 +1805,31 @@
         }
         return null;
     }
+    // Lists on some jobs have a different (or no) action bar. Rather than give up, put our own slim bar
+    // directly above the list so the Columns/Rows button and the smart filter are always available.
+    const FALLBACK_BAR_ID = 'sdx-qol-fallback-bar';
+    let fallbackNoticeShown = false;
+    function findFallbackBar() {
+        const gridEl = [...document.querySelectorAll('.k-grid')].find(g => isVisible(g) && getKendoWidgetFromElement(g, ['kendoGrid']));
+        if (!gridEl || !gridEl.parentElement) return null;
+        let bar = document.getElementById(FALLBACK_BAR_ID);
+        if (!bar || !bar.isConnected) {
+            bar = document.createElement('div');
+            bar.id = FALLBACK_BAR_ID;
+            bar.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:6px 8px;box-sizing:border-box;';
+            gridEl.parentElement.insertBefore(bar, gridEl);
+            if (!fallbackNoticeShown) {
+                fallbackNoticeShown = true;
+                console.log(`${SCRIPT_NAME}: list toolbar not recognised on this page; using a bar above the list instead. Buttons seen:`,
+                    [...document.querySelectorAll('button')].filter(isVisible).map(b => normalizeText(b.innerText || b.textContent)).filter(Boolean).slice(0, 15));
+            }
+        }
+        return { parent: bar, after: null };
+    }
     function injectManagerButton() {
         if (!isTopFrame()) return;
         if (document.getElementById(MANAGER.buttonId)) return;
-        const anchor = findActionBarAnchor();
+        const anchor = findActionBarAnchor() || findFallbackBar();
         if (!anchor) return;
         const button = document.createElement('button');
         button.id = MANAGER.buttonId;
@@ -4656,6 +4677,7 @@
                 }));
             });
             vocab.words = words;
+            vocab.rows = rows;
             // Originating org (supplier) names: remember what has been seen so a supplier name works even
             // when none of their documents are on the current page.
             const orgCol = (cols || []).find(c => c.field === 'Originating_Org') || (cols || []).find(c => /^originating org/i.test(c.title));
@@ -4705,6 +4727,54 @@
         const cols = Array.from(out.values());
         if (cols.length) smartFilter.lastCols = cols; // an empty result page has no rows to read keys from
         return cols.length > 3 ? cols : (smartFilter.lastCols || cols);
+    }
+    // ---- contract column choice -------------------------------------------------------------------------
+    const SF_PREFS_KEY = `${STORAGE_PREFIX}:sfPrefs`;
+    function sfLoadPrefs() {
+        try { return JSON.parse(localStorage.getItem(SF_PREFS_KEY) || '{}') || {}; } catch (err) { return {}; }
+    }
+    function sfSavePref(key, value) {
+        try {
+            const prefs = sfLoadPrefs();
+            prefs[key] = value;
+            localStorage.setItem(SF_PREFS_KEY, JSON.stringify(prefs));
+        } catch (err) { /* optional */ }
+    }
+    // Columns that can hold a contract number on this list.
+    function sfContractCandidates(cols) {
+        return cols.filter(c => c.type !== 'date' && (/contract/i.test(c.field) || /contract/i.test(c.title) || /^item$/i.test(c.title) || /^item$/i.test(c.field)));
+    }
+    function sfContractPrefKey(cands) {
+        return 'contract:' + cands.map(c => c.field).sort().join('|');
+    }
+    // Picks the column a bare contract number should filter: the one whose loaded values contain that number in
+    // the most rows; on a tie (or when none are loaded) the user's last manual choice for this kind of list, then
+    // To Contract > From Contract > anything else.
+    function sfPickContractColumn(tok, cols, vocab) {
+        const cands = sfContractCandidates(cols);
+        if (!cands.length) return null;
+        const valueFor = c => (/item/i.test(c.field) && /^\d{4}$/.test(tok) ? '.' + tok : tok);
+        const rows = (vocab && vocab.rows) || [];
+        const scored = cands.map(c => {
+            const needle = valueFor(c).toLowerCase();
+            const hits = rows.reduce((n, r) => n + (String((r && r[c.field]) == null ? '' : r[c.field]).toLowerCase().includes(needle) ? 1 : 0), 0);
+            return { c, hits };
+        });
+        const best = Math.max.apply(null, scored.map(x => x.hits));
+        let pool = scored.filter(x => x.hits === best).map(x => x.c);
+        if (pool.length > 1) {
+            const pref = sfLoadPrefs()[sfContractPrefKey(cands)];
+            const rank = c => {
+                if (pref && c.field === pref) return 0;
+                if (/to.?contract/i.test(c.field)) return 1;
+                if (/from.?contract/i.test(c.field)) return 2;
+                if (/contract/i.test(c.field)) return 3;
+                return 4;
+            };
+            pool = pool.slice().sort((x, y) => rank(x) - rank(y));
+        }
+        const chosen = pool[0];
+        return { field: chosen.field, value: valueFor(chosen), note: /item/i.test(chosen.field) ? 'contract' : undefined };
     }
     // Turns typed text into editable chips: { fields, op, value, kind }.
     function sfParse(input, cols, vocab, now) {
@@ -4867,12 +4937,15 @@
                 continue;
             }
             // contract numbers: any 4-digit number, 5.8220, 186688-5.8220.
-            // Lists without a To Contract column (To Do List) carry the contract inside "Item" (186688-5.8220-0311).
-            if (/^(?:\d{6}-)?(?:\d\.)?\d{4}$/.test(tok) && (has('To_Contract') || has('Item'))) {
-                if (has('To_Contract')) chips.push({ fields: ['To_Contract'], op: 'contains', value: tok, kind: 'text' });
-                else chips.push({ fields: ['Item'], op: 'contains', value: /^\d{4}$/.test(tok) ? '.' + tok : tok, kind: 'text', note: 'contract' });
-                i++;
-                continue;
+            // Which column holds the contract differs by list and by job (To Contract, From Contract, or inside
+            // "Item" on a To Do List), so it is chosen from this list's own columns and loaded data.
+            if (/^(?:\d{6}-)?(?:\d\.)?\d{4}$/.test(tok)) {
+                const pick = sfPickContractColumn(tok, cols, vocab);
+                if (pick) {
+                    chips.push({ fields: [pick.field], op: 'contains', value: pick.value, kind: 'text', contract: true, note: pick.note });
+                    i++;
+                    continue;
+                }
             }
             // document numbers: prs-com-cp-111, cp-111-01
             if (/^[a-z0-9]+(?:-[a-z0-9]+){2,}$/.test(tok) && /\d/.test(tok)) {
@@ -5211,6 +5284,12 @@
             select.addEventListener('change', function () {
                 if (!select.value) return;
                 chip.fields = [select.value];
+                if (chip.contract) {
+                    const cands = sfContractCandidates(cols);
+                    if (cands.some(c => c.field === select.value)) sfSavePref(sfContractPrefKey(cands), select.value);
+                    if (/item/i.test(select.value) && /^\d{4}$/.test(String(chip.value).replace(/^\./, ''))) chip.value = '.' + String(chip.value).replace(/^\./, '');
+                    else chip.value = String(chip.value).replace(/^\./, '');
+                }
                 sfReapply();
             });
             row.appendChild(select);
