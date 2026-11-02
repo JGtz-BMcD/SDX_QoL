@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SDx QoL Improvement
 // @namespace    https://burnsmcd.com
-// @version      1.10
+// @version      1.13
 // @description  SDx quality-of-life improvements: shift-select, keyboard shortcuts, truncated-cell tooltips, column manager, per-list remembered page size (applied before the first load), To Do List row highlighting, optional auto-close of the To Do List step-details panel, bulk file download (bypasses SDx's 100-file dialog limit), in-page PDF preview with next/previous, search, zoom, fit, print and download, work package indexing that turns document numbers on sheets into clickable links, and a typed smart filter for any list.
 // @match        https://*.intergraphsmartcloud.com/*
 // @grant        none
@@ -34,7 +34,7 @@
     };
     const DL_BUTTON_ID = 'sdx-qol-dl-files-btn';
     const DL_MODAL_ID = 'sdx-qol-dl-files-modal';
-    console.log(`${SCRIPT_NAME} v1.10 loaded`);
+    console.log(`${SCRIPT_NAME} v1.13 loaded`);
     //////////////////////////////////////////////////////////////////////
     // MODULE 0
     // EARLY KENDO DATASOURCE HOOK (page size)
@@ -1590,10 +1590,52 @@
             .sdx-qol-pv-scroll {
                 position: absolute !important;
                 inset: 0 !important;
-                overflow: auto !important;
+                overflow: scroll !important;
+                scrollbar-gutter: stable !important;
                 padding: 12px 0 !important;
                 box-sizing: border-box !important;
                 background: #525659 !important;
+            }
+            .sdx-qol-pv-scroll.sdx-qol-pv-panning { cursor: grabbing !important; user-select: none !important; }
+            .sdx-qol-pv-hint {
+                position: absolute !important;
+                left: 50% !important;
+                bottom: 22px !important;
+                transform: translateX(-50%) !important;
+                z-index: 5 !important;
+                max-width: min(560px, 90%) !important;
+                display: flex !important;
+                align-items: center !important;
+                gap: 12px !important;
+                padding: 10px 14px !important;
+                background: #0b3d6e !important;
+                color: #ffffff !important;
+                border-radius: 8px !important;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.5) !important;
+                font: 13px/1.4 Arial, sans-serif !important;
+            }
+            .sdx-qol-pv-hint button {
+                flex: 0 0 auto !important;
+                padding: 4px 12px !important;
+                border: 0 !important;
+                border-radius: 4px !important;
+                background: #ffffff !important;
+                color: #0b3d6e !important;
+                font: bold 12px Arial, sans-serif !important;
+                cursor: pointer !important;
+            }
+            .sdx-qol-pv-page.sdx-qol-pv-busy::after {
+                content: 'Drawing...' !important;
+                position: absolute !important;
+                top: 8px !important;
+                left: 8px !important;
+                z-index: 3 !important;
+                padding: 3px 10px !important;
+                background: rgba(11,61,110,0.9) !important;
+                color: #ffffff !important;
+                border-radius: 4px !important;
+                font: bold 12px Arial, sans-serif !important;
+                pointer-events: none !important;
             }
             .sdx-qol-pv-page {
                 position: relative !important;
@@ -2273,6 +2315,31 @@
         engineSection.appendChild(engineLabel);
         engineSection.appendChild(engineNote);
         menu.appendChild(engineSection);
+        // --- Render quality ---
+        const qualitySection = document.createElement('div');
+        qualitySection.className = 'sdx-section';
+        const qualityLabel = document.createElement('label');
+        qualityLabel.textContent = 'Render quality ';
+        const qualitySelect = document.createElement('select');
+        [['fast', 'Fast (lowest sharpness)'], ['balanced', 'Balanced (recommended)'], ['sharp', 'Sharp (slowest)']].forEach(([value, text]) => {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = text;
+            if (settings.quality === value) opt.selected = true;
+            qualitySelect.appendChild(opt);
+        });
+        qualitySelect.addEventListener('change', function () {
+            const s = loadViewerSettings();
+            s.quality = qualitySelect.value;
+            saveViewerSettings(s);
+        });
+        qualityLabel.appendChild(qualitySelect);
+        const qualityNote = document.createElement('div');
+        qualityNote.className = 'sdx-note';
+        qualityNote.textContent = 'Large, detailed drawings draw faster at lower sharpness, especially on high-resolution or scaled displays. Zoom in for more detail at any setting. Applies to the next PDF opened.';
+        qualitySection.appendChild(qualityLabel);
+        qualitySection.appendChild(qualityNote);
+        menu.appendChild(qualitySection);
         // --- 3. Cache size + purge ---
         const cacheSection = document.createElement('div');
         cacheSection.className = 'sdx-section';
@@ -3124,7 +3191,7 @@
     // Edge; fit page/width always honored), 'native' = the browser's built-in
     // PDF viewer in an iframe (Edge's ignores the fit setting).
     function getDefaultViewerSettings() {
-        return { enabled: true, view: 'Fit', cacheMax: 5, engine: 'pdfjs', docLinks: true };
+        return { enabled: true, view: 'Fit', cacheMax: 5, engine: 'pdfjs', docLinks: true, quality: 'balanced' };
     }
     function loadViewerSettings() {
         const defaults = getDefaultViewerSettings();
@@ -3138,6 +3205,7 @@
                 view: parsed.view === 'FitH' ? 'FitH' : 'Fit',
                 cacheMax: Number.isFinite(cacheMax) ? Math.min(100, Math.max(0, Math.round(cacheMax))) : defaults.cacheMax,
                 engine: parsed.engine === 'native' ? 'native' : 'pdfjs',
+                quality: ['fast', 'balanced', 'sharp'].includes(parsed.quality) ? parsed.quality : defaults.quality,
                 docLinks: typeof parsed.docLinks === 'boolean' ? parsed.docLinks : defaults.docLinks
             };
         } catch (err) {
@@ -3151,6 +3219,7 @@
                 view: settings.view === 'FitH' ? 'FitH' : 'Fit',
                 cacheMax: Math.min(100, Math.max(0, Math.round(Number(settings.cacheMax) || 0))),
                 engine: settings.engine === 'native' ? 'native' : 'pdfjs',
+                quality: ['fast', 'balanced', 'sharp'].includes(settings.quality) ? settings.quality : 'balanced',
                 docLinks: settings.docLinks !== false
             }));
         } catch (err) {
@@ -3387,13 +3456,13 @@
         const zoomOutBtn = document.createElement('button');
         zoomOutBtn.type = 'button';
         zoomOutBtn.textContent = '−';
-        zoomOutBtn.title = 'Zoom out';
+        zoomOutBtn.title = 'Zoom out (or hold Alt and scroll the mouse wheel)';
         zoomOutBtn.style.display = 'none';
         zoomOutBtn.addEventListener('click', function () { pvZoom(1 / 1.25); });
         const zoomInBtn = document.createElement('button');
         zoomInBtn.type = 'button';
         zoomInBtn.textContent = '+';
-        zoomInBtn.title = 'Zoom in';
+        zoomInBtn.title = 'Zoom in (or hold Alt and scroll the mouse wheel)';
         zoomInBtn.style.display = 'none';
         zoomInBtn.addEventListener('click', function () { pvZoom(1.25); });
         const fitPageBtn = document.createElement('button');
@@ -3422,7 +3491,21 @@
         header.appendChild(pageEl);
         header.appendChild(searchWrap);
         header.appendChild(zoomOutBtn);
+        const rotateCcwBtn = document.createElement('button');
+        rotateCcwBtn.type = 'button';
+        rotateCcwBtn.textContent = '\u27F2';
+        rotateCcwBtn.title = 'Rotate counter-clockwise (remembered for this document)';
+        rotateCcwBtn.style.display = 'none';
+        rotateCcwBtn.addEventListener('click', function () { pvRotate(-90); });
+        const rotateCwBtn = document.createElement('button');
+        rotateCwBtn.type = 'button';
+        rotateCwBtn.textContent = '\u27F3';
+        rotateCwBtn.title = 'Rotate clockwise (remembered for this document)';
+        rotateCwBtn.style.display = 'none';
+        rotateCwBtn.addEventListener('click', function () { pvRotate(90); });
         header.appendChild(zoomInBtn);
+        header.appendChild(rotateCcwBtn);
+        header.appendChild(rotateCwBtn);
         header.appendChild(fitPageBtn);
         header.appendChild(fitWidthBtn);
         header.appendChild(downloadBtn);
@@ -3474,7 +3557,7 @@
             }
         };
         document.addEventListener('keydown', pvEscHandler, true);
-        const ui = { titleEl, counterEl, openBtn, body, status, prevBtn, nextBtn, fitPageBtn, fitWidthBtn, pageEl, zoomOutBtn, zoomInBtn, searchWrap, searchInput, searchCount, downloadBtn, printBtn, backBtn, blobUrl: null, frame: null, viewer: null, linkCtx: null };
+        const ui = { titleEl, counterEl, openBtn, body, status, prevBtn, nextBtn, fitPageBtn, fitWidthBtn, pageEl, zoomOutBtn, zoomInBtn, rotateCcwBtn, rotateCwBtn, searchWrap, searchInput, searchCount, downloadBtn, printBtn, backBtn, blobUrl: null, frame: null, viewer: null, linkCtx: null };
         pvActiveUi = ui;
         return ui;
     }
@@ -3542,6 +3625,19 @@
             pvLoadFrame(ui, s.view);
         }
     }
+    // Page rotation chosen by the user, remembered (in memory, this browser session) per document so that
+    // stepping back through recently viewed documents does not need the same clicks again.
+    const pvRotationMemory = new Map(); // document OBID -> 0 | 90 | 180 | 270
+    const PV_ROTATION_MEMORY_MAX = 200;
+    function pvRememberRotation(key, rotation) {
+        if (!key) return;
+        pvRotationMemory.delete(key);
+        if (rotation) pvRotationMemory.set(key, rotation); // 0 = default, nothing to remember
+        while (pvRotationMemory.size > PV_ROTATION_MEMORY_MAX) pvRotationMemory.delete(pvRotationMemory.keys().next().value);
+    }
+    function pvRotate(delta) {
+        if (pvActiveUi && pvActiveUi.viewer && pvActiveUi.viewer.rotateBy) pvActiveUi.viewer.rotateBy(delta);
+    }
     function pvZoom(factor) {
         if (pvActiveUi && pvActiveUi.viewer) pvActiveUi.viewer.zoomBy(factor);
     }
@@ -3581,6 +3677,27 @@
     // Builds a scrollable, lazily-rendered viewer for one PDF inside
     // ui.body. Pages are drawn only when scrolled near, and re-drawn when
     // the fit mode, zoom, or window size changes.
+    // One-time tip shown the first time the viewer opens, so users learn the wheel-zoom and drag-to-pan.
+    function pvShowHintOnce(ui) {
+        const key = `${STORAGE_PREFIX}:pvHintSeen`;
+        try { if (localStorage.getItem(key) === '1') return; } catch (err) { /* show it anyway */ }
+        const tip = document.createElement('div');
+        tip.className = 'sdx-qol-pv-hint';
+        const text = document.createElement('span');
+        text.textContent = 'Tip: hold Alt and scroll the mouse wheel to zoom. Hold the right mouse button and drag to move around the page.';
+        const ok = document.createElement('button');
+        ok.type = 'button';
+        ok.textContent = 'Got it';
+        const dismiss = function () {
+            tip.remove();
+            try { localStorage.setItem(key, '1'); } catch (err) { /* ignore */ }
+        };
+        ok.addEventListener('click', dismiss);
+        tip.appendChild(text);
+        tip.appendChild(ok);
+        ui.body.appendChild(tip);
+        setTimeout(function () { if (tip.isConnected) dismiss(); }, 20000);
+    }
     async function pvCreatePdfJsViewer(ui, blob, initialMode) {
         const lib = window.pdfjsLib;
         await pvEnsureWorker();
@@ -3595,13 +3712,18 @@
         let gen = 0;
         let mode = initialMode === 'FitH' ? 'FitH' : 'Fit';
         let zoom = 1;
-        let renderChain = Promise.resolve();
+        let rotation = pvRotationMemory.get(ui.rotationKey) || 0; // user rotation on top of each page's own
+        const viewRotation = page => (((page.rotate || 0) + rotation) % 360 + 360) % 360;
+        let zoomTimer = null;
+        let zooming = false; // true between a zoom action and the settled re-render
+        let panCleanup = null;
+        const MAX_LIVE_PAGES = 6; // rendered pages kept at once; farther ones are freed to protect memory
         let scroll = null;
         let io = null;
         let ro = null;
         try {
             const firstPage = await doc.getPage(1);
-            const baseVp = firstPage.getViewport({ scale: 1 });
+            let baseVp = firstPage.getViewport({ scale: 1, rotation: viewRotation(firstPage) });
             scroll = document.createElement('div');
             scroll.className = 'sdx-qol-pv-scroll';
             const wrappers = [];
@@ -3708,6 +3830,40 @@
                 const fit = mode === 'FitH' ? cw / w : Math.min(cw / w, ch / h);
                 return fit * zoom;
             }
+            // Frees pages far from the viewport once more than MAX_LIVE_PAGES are drawn. Large drawings with many
+            // comments can use tens of MB per page, and keeping them all is what made big PDFs unstable.
+            function evictPage(entry) {
+                if (entry.task) { try { entry.task.cancel(); } catch (err) { /* ignore */ } }
+                if (entry.textTask) { try { entry.textTask.cancel(); } catch (err) { /* ignore */ } }
+                entry.rendered = false;
+                entry.ensureText = null;
+                entry.task = null;
+                entry.textTask = null;
+                entry.textPromise = null;
+                entry.textStrs = [];
+                entry.textDivs = [];
+                entry.currentRun = -1;
+                entry.el.textContent = '';
+                // Anyone waiting for this page (search) must wait for its NEXT render.
+                if (entry.resolveReady) entry.resolveReady();
+                entry.ready = new Promise(resolve => { entry.resolveReady = resolve; });
+            }
+            function enforceBudget(keep) {
+                const live = wrappers.filter(e => e.rendered && e.el.firstChild);
+                if (live.length <= MAX_LIVE_PAGES) return;
+                const sr = scroll.getBoundingClientRect();
+                const mid = sr.top + sr.height / 2;
+                live.filter(e => e !== keep)
+                    .map(e => {
+                        const r = e.el.getBoundingClientRect();
+                        const far = r.bottom < sr.top - sr.height || r.top > sr.bottom + sr.height;
+                        return { e, d: far ? Math.abs((r.top + r.bottom) / 2 - mid) : -1 };
+                    })
+                    .filter(x => x.d >= 0)
+                    .sort((a, b) => b.d - a.d)
+                    .slice(0, live.length - MAX_LIVE_PAGES)
+                    .forEach(x => evictPage(x.e));
+            }
             async function renderPage(entry, index, myGen) {
                 const done = entry.resolveReady;
                 try {
@@ -3720,12 +3876,17 @@
                 if (destroyed || myGen !== gen || entry.rendered) return;
                 const page = await doc.getPage(index + 1);
                 if (destroyed || myGen !== gen) return;
-                const base = page.getViewport({ scale: 1 });
-                const vp = page.getViewport({ scale: scaleFor(base.width, base.height) });
-                let outScale = window.devicePixelRatio || 1;
+                const base = page.getViewport({ scale: 1, rotation: viewRotation(page) });
+                const vp = page.getViewport({ scale: scaleFor(base.width, base.height), rotation: viewRotation(page) });
+                // Render resolution: high-DPI screens make 4x the pixels at "Sharp"; "Balanced" caps the
+                // extra sharpness at 1.5x, "Fast" draws at screen resolution. Zooming in always adds detail.
+                const quality = loadViewerSettings().quality;
+                const dpr = window.devicePixelRatio || 1;
+                let outScale = quality === 'sharp' ? dpr : quality === 'fast' ? Math.min(dpr, 1) : Math.min(dpr, 1.5);
                 // Cap canvas size so huge drawings at high zoom can't exhaust memory.
-                if (vp.width * vp.height * outScale * outScale > 16e6) {
-                    outScale = Math.max(0.5, Math.sqrt(16e6 / (vp.width * vp.height)));
+                const pixelCap = quality === 'fast' ? 8e6 : 16e6;
+                if (vp.width * vp.height * outScale * outScale > pixelCap) {
+                    outScale = Math.max(0.5, Math.sqrt(pixelCap / (vp.width * vp.height)));
                 }
                 const canvas = document.createElement('canvas');
                 canvas.width = Math.max(1, Math.floor(vp.width * outScale));
@@ -3736,6 +3897,10 @@
                 entry.el.style.width = canvas.style.width;
                 entry.el.style.height = canvas.style.height;
                 entry.rendered = true;
+                // Show the canvas straight away: PDF.js paints heavy pages in slices, so the drawing appears
+                // progressively instead of staying blank until the whole page is finished.
+                entry.el.appendChild(canvas);
+                entry.el.classList.add('sdx-qol-pv-busy');
                 const task = page.render({
                     canvasContext: canvas.getContext('2d'),
                     viewport: vp,
@@ -3745,56 +3910,97 @@
                 try {
                     await task.promise;
                     if (destroyed || myGen !== gen) return;
-                    entry.el.appendChild(canvas);
-                    // Selectable/searchable text on top of the canvas. Failure
-                    // here only costs select/search for this page.
-                    try {
-                        const textDiv = document.createElement('div');
-                        // 'textLayer' is the class PDF.js itself expects on this container.
-                        textDiv.className = 'textLayer sdx-qol-pv-text';
-                        textDiv.style.setProperty('--scale-factor', String(vp.scale));
-                        entry.el.appendChild(textDiv);
-                        entry.textStrs = [];
-                        entry.textDivs = [];
-                        const textTask = lib.renderTextLayer({
-                            textContentSource: page.streamTextContent(),
-                            container: textDiv,
-                            viewport: vp,
-                            textDivs: entry.textDivs,
-                            textContentItemsStr: entry.textStrs
-                        });
-                        entry.textTask = textTask;
-                        entry.textPromise = textTask.promise
-                            .then(() => {
-                                if (destroyed || myGen !== gen) return;
-                                applyHighlights(entry);
-                                // Clickable links to other sheets in the same indexed work package.
-                                if (ui.linkCtx) {
-                                    try { pvDrawDocLinks(entry, ui.linkCtx); } catch (linkErr) {
-                                        console.warn('SDx QoL: document link overlay failed', linkErr);
+                    enforceBudget(entry);
+                    // Selectable/searchable text on top of the canvas is built lazily (it is the slow part for
+                    // CAD drawings with huge amounts of text): shortly after drawing, or immediately when a
+                    // search or link overlay needs it. Failure here only costs select/search for this page.
+                    entry.ensureText = function () {
+                        if (entry.textPromise) return entry.textPromise;
+                        if (destroyed || myGen !== gen || !entry.rendered || !entry.el.isConnected) return Promise.resolve();
+                        try {
+                            const textDiv = document.createElement('div');
+                            // 'textLayer' is the class PDF.js itself expects on this container.
+                            textDiv.className = 'textLayer sdx-qol-pv-text';
+                            textDiv.style.setProperty('--scale-factor', String(vp.scale));
+                            entry.el.appendChild(textDiv);
+                            entry.textStrs = [];
+                            entry.textDivs = [];
+                            const textTask = lib.renderTextLayer({
+                                textContentSource: page.streamTextContent(),
+                                container: textDiv,
+                                viewport: vp,
+                                textDivs: entry.textDivs,
+                                textContentItemsStr: entry.textStrs
+                            });
+                            entry.textTask = textTask;
+                            entry.textPromise = textTask.promise
+                                .then(() => {
+                                    if (destroyed || myGen !== gen) return;
+                                    applyHighlights(entry);
+                                    // Clickable links to other sheets in the same indexed work package.
+                                    if (ui.linkCtx) {
+                                        try { pvDrawDocLinks(entry, ui.linkCtx); } catch (linkErr) {
+                                            console.warn('SDx QoL: document link overlay failed', linkErr);
+                                        }
                                     }
-                                }
-                            })
-                            .catch(() => {});
-                    } catch (textErr) {
-                        console.warn('SDx QoL: PDF.js text layer failed for a page', textErr);
-                    }
+                                })
+                                .catch(() => {});
+                        } catch (textErr) {
+                            console.warn('SDx QoL: PDF.js text layer failed for a page', textErr);
+                            entry.textPromise = Promise.resolve();
+                        }
+                        return entry.textPromise;
+                    };
+                    const whenIdle = window.requestIdleCallback ? (cb => window.requestIdleCallback(cb, { timeout: 700 })) : (cb => setTimeout(cb, 120));
+                    whenIdle(function () {
+                        if (!destroyed && myGen === gen && entry.rendered && entry.ensureText) entry.ensureText();
+                    });
                 } catch (err) {
                     if (!err || err.name !== 'RenderingCancelledException') {
                         console.warn('SDx QoL: PDF.js page render failed', err);
                     }
                 } finally {
                     entry.task = null;
+                    entry.el.classList.remove('sdx-qol-pv-busy');
+                }
+            }
+            // Pages wait in a queue and the one nearest the middle of the viewport is drawn next, so what the
+            // user is looking at appears before the pages that were only pre-loaded around it.
+            const renderQueue = [];
+            let pumping = false;
+            async function pumpRenders() {
+                if (pumping) return;
+                pumping = true;
+                try {
+                    while (renderQueue.length && !destroyed) {
+                        const sr = scroll.getBoundingClientRect();
+                        const mid = sr.top + sr.height / 2;
+                        let bestIndex = 0;
+                        let bestDist = Infinity;
+                        renderQueue.forEach((job, i) => {
+                            const r = job.entry.el.getBoundingClientRect();
+                            const visible = r.bottom > sr.top && r.top < sr.bottom;
+                            const dist = (visible ? 0 : 1e6) + Math.abs((r.top + r.bottom) / 2 - mid);
+                            if (dist < bestDist) { bestDist = dist; bestIndex = i; }
+                        });
+                        const job = renderQueue.splice(bestIndex, 1)[0];
+                        if (job.myGen !== gen || job.entry.rendered) continue;
+                        try { await renderPage(job.entry, job.index, job.myGen); } catch (err) { /* keep going */ }
+                    }
+                } finally {
+                    pumping = false;
                 }
             }
             io = new IntersectionObserver(function (items) {
+                if (zooming) return; // the settled re-render after a zoom re-observes every page
                 items.forEach(item => {
                     if (!item.isIntersecting) return;
                     const index = Number(item.target.dataset.page) - 1;
                     const entry = wrappers[index];
-                    const myGen = gen;
-                    renderChain = renderChain.then(() => renderPage(entry, index, myGen)).catch(() => {});
+                    if (entry.rendered || renderQueue.some(j => j.entry === entry && j.myGen === gen)) return;
+                    renderQueue.push({ entry, index, myGen: gen });
                 });
+                pumpRenders();
             }, { root: scroll, rootMargin: '300px 0px' });
             function updatePageLabel() {
                 if (destroyed) return;
@@ -3807,8 +4013,27 @@
                 }
                 ui.pageEl.textContent = `Page ${current} / ${doc.numPages}`;
             }
-            function layout() {
+            // Keeps the same point of the document under the same point of the viewport across a size change.
+            function captureAnchor(px, py) {
+                const sr = scroll.getBoundingClientRect();
+                const x = typeof px === 'number' ? px : sr.width / 2;
+                const y = typeof py === 'number' ? py : sr.height / 2;
+                // Only anchor an axis that actually scrolls (before the first layout nothing does).
+                return {
+                    x, y,
+                    fx: scroll.scrollWidth > scroll.clientWidth + 1 ? (scroll.scrollLeft + x) / scroll.scrollWidth : null,
+                    fy: scroll.scrollHeight > scroll.clientHeight + 1 ? (scroll.scrollTop + y) / scroll.scrollHeight : null
+                };
+            }
+            function restoreAnchor(a) {
+                if (a.fx !== null) scroll.scrollLeft = a.fx * scroll.scrollWidth - a.x;
+                if (a.fy !== null) scroll.scrollTop = a.fy * scroll.scrollHeight - a.y;
+            }
+            function layout(keepScroll) {
+                const anchor = keepScroll === false ? null : captureAnchor();
+                zooming = false;
                 gen++;
+                renderQueue.length = 0;
                 const s = scaleFor(baseVp.width, baseVp.height);
                 wrappers.forEach(entry => {
                     if (entry.task) {
@@ -3818,6 +4043,7 @@
                         try { entry.textTask.cancel(); } catch (err) { /* ignore */ }
                     }
                     entry.rendered = false;
+                    entry.ensureText = null;
                     entry.textTask = null;
                     entry.textPromise = null;
                     entry.textStrs = [];
@@ -3829,10 +4055,86 @@
                     entry.el.style.width = `${Math.floor(baseVp.width * s)}px`;
                     entry.el.style.height = `${Math.floor(baseVp.height * s)}px`;
                 });
+                if (anchor) restoreAnchor(anchor);
                 io.disconnect();
                 wrappers.forEach(entry => io.observe(entry.el));
                 updatePageLabel();
             }
+            // Instant feedback while zooming: resize what is already drawn with CSS, drop the text/highlight
+            // overlays (they would be misplaced), and do the real re-render once the user stops zooming.
+            function previewZoom(ratio) {
+                zooming = true;
+                gen++;
+                renderQueue.length = 0;
+                wrappers.forEach(entry => {
+                    if (entry.task) { try { entry.task.cancel(); } catch (err) { /* ignore */ } entry.task = null; }
+                    if (entry.textTask) { try { entry.textTask.cancel(); } catch (err) { /* ignore */ } entry.textTask = null; }
+                    const w = parseFloat(entry.el.style.width) || 0;
+                    const h = parseFloat(entry.el.style.height) || 0;
+                    entry.el.style.width = `${Math.max(1, Math.floor(w * ratio))}px`;
+                    entry.el.style.height = `${Math.max(1, Math.floor(h * ratio))}px`;
+                    entry.el.querySelectorAll('canvas').forEach(c => {
+                        c.style.width = `${Math.max(1, Math.floor((parseFloat(c.style.width) || 0) * ratio))}px`;
+                        c.style.height = `${Math.max(1, Math.floor((parseFloat(c.style.height) || 0) * ratio))}px`;
+                    });
+                    entry.el.querySelectorAll('.textLayer, .sdx-qol-pv-hl, .sdx-qol-pv-links').forEach(x => { x.style.display = 'none'; });
+                });
+            }
+            function zoomTo(newZoom, px, py) {
+                newZoom = Math.min(8, Math.max(0.25, newZoom));
+                if (Math.abs(newZoom - zoom) < 1e-6) return;
+                const anchor = captureAnchor(px, py);
+                const ratio = newZoom / zoom;
+                zoom = newZoom;
+                previewZoom(ratio);
+                restoreAnchor(anchor);
+                clearTimeout(zoomTimer);
+                zoomTimer = setTimeout(function () { if (!destroyed) layout(); }, 260);
+            }
+            // Alt (or Ctrl / pinch) + mouse wheel zooms around the pointer.
+            scroll.addEventListener('wheel', function (e) {
+                if (!(e.altKey || e.ctrlKey)) return;
+                e.preventDefault();
+                const delta = e.deltaY || e.deltaX;
+                if (!delta) return;
+                const sr = scroll.getBoundingClientRect();
+                const step = Math.min(Math.abs(delta), 120) * 0.0016;
+                zoomTo(zoom * Math.exp(delta < 0 ? step : -step), e.clientX - sr.left, e.clientY - sr.top);
+            }, { passive: false });
+            // Right mouse button + drag pans. A right click without dragging still opens the normal menu.
+            let suppressMenu = false;
+            scroll.addEventListener('mousedown', function (e) {
+                if (e.button !== 2) return;
+                const start = { x: e.clientX, y: e.clientY, l: scroll.scrollLeft, t: scroll.scrollTop, moved: false };
+                const move = function (ev) {
+                    const dx = ev.clientX - start.x;
+                    const dy = ev.clientY - start.y;
+                    if (!start.moved && Math.hypot(dx, dy) < 5) return;
+                    start.moved = true;
+                    suppressMenu = true;
+                    scroll.classList.add('sdx-qol-pv-panning');
+                    scroll.scrollLeft = start.l - dx;
+                    scroll.scrollTop = start.t - dy;
+                    ev.preventDefault();
+                };
+                const up = function (ev) {
+                    if (ev.button !== 2) return;
+                    cleanup();
+                    if (start.moved) setTimeout(function () { suppressMenu = false; }, 300);
+                };
+                const cleanup = function () {
+                    document.removeEventListener('mousemove', move, true);
+                    document.removeEventListener('mouseup', up, true);
+                    scroll.classList.remove('sdx-qol-pv-panning');
+                    panCleanup = null;
+                };
+                panCleanup = cleanup;
+                document.addEventListener('mousemove', move, true);
+                document.addEventListener('mouseup', up, true);
+            });
+            scroll.addEventListener('contextmenu', function (e) {
+                if (suppressMenu) e.preventDefault();
+            });
             let scrollQueued = false;
             scroll.addEventListener('scroll', function () {
                 if (scrollQueued) return;
@@ -3851,11 +4153,13 @@
                 const h = scroll.clientHeight;
                 if (w === lastW && h === lastH) return;
                 const first = lastW === 0 && lastH === 0;
+                // Ignore tiny changes (scrollbar appearing/disappearing) - reacting to them can loop.
+                if (!first && Math.abs(w - lastW) < 30 && Math.abs(h - lastH) < 30) return;
                 lastW = w;
                 lastH = h;
                 if (first) return;
                 clearTimeout(resizeTimer);
-                resizeTimer = setTimeout(layout, 150);
+                resizeTimer = setTimeout(function () { if (!destroyed && !zooming) layout(); }, 150);
             });
             ro.observe(scroll);
             layout();
@@ -3863,11 +4167,19 @@
                 setMode(newMode) {
                     mode = newMode === 'FitH' ? 'FitH' : 'Fit';
                     zoom = 1;
-                    layout();
+                    clearTimeout(zoomTimer);
+                    layout(false);
                     scroll.scrollTop = 0;
                 },
                 zoomBy(factor) {
-                    zoom = Math.min(8, Math.max(0.25, zoom * factor));
+                    zoomTo(zoom * factor);
+                },
+                // Turns every page by 90 degrees (positive = clockwise) and re-draws.
+                rotateBy(delta) {
+                    rotation = (((rotation + delta) % 360) + 360) % 360;
+                    pvRememberRotation(ui.rotationKey, rotation);
+                    baseVp = firstPage.getViewport({ scale: 1, rotation: viewRotation(firstPage) });
+                    clearTimeout(zoomTimer);
                     layout();
                 },
                 // Find text. A new query jumps to the first match; repeating the
@@ -3919,6 +4231,7 @@
                     entry.el.scrollIntoView({ block: 'start' });
                     // The scroll makes the page render; wait for it and its text layer.
                     await entry.ready;
+                    if (entry.ensureText) entry.ensureText();
                     if (entry.textPromise) await entry.textPromise;
                     if (destroyed || searchState.index !== nextIndex) return;
                     applyHighlights(entry);
@@ -3932,6 +4245,9 @@
                     if (destroyed) return;
                     destroyed = true;
                     gen++;
+                    clearTimeout(zoomTimer);
+                    clearTimeout(resizeTimer);
+                    if (panCleanup) panCleanup();
                     searchState.token++;
                     try { io.disconnect(); } catch (err) { /* ignore */ }
                     try { ro.disconnect(); } catch (err) { /* ignore */ }
@@ -4010,6 +4326,9 @@
                 ui.searchWrap.style.display = '';
                 ui.zoomOutBtn.style.display = '';
                 ui.zoomInBtn.style.display = '';
+                ui.rotateCcwBtn.style.display = '';
+                ui.rotateCwBtn.style.display = '';
+                pvShowHintOnce(ui);
                 pvMarkFitButtons(ui, settings.view);
                 return;
             } catch (err) {
@@ -4094,6 +4413,7 @@
     }
     async function openPdfPreview(obid, name, config) {
         const ui = buildPreviewModal(name);
+        ui.rotationKey = obid;
         pvCurrentObid = obid;
         pvCurrentMeta = { obid, name, config };
         pvLastObid = obid;
